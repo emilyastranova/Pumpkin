@@ -14,6 +14,7 @@ use crate::{
     command::{
         CommandSender, CommandSource,
         context::command_source::{ResultValueTaker, ReturnValue, ReturnValueCallable},
+        errors::command_syntax_error::CommandSyntaxError,
     },
     entity::{Entity, EntityBase, player::Player},
     world::World,
@@ -24,10 +25,11 @@ struct SuccessCounter {
 }
 
 impl ReturnValueCallable for SuccessCounter {
-    fn call(&self, value: ReturnValue) {
+    fn call(&self, value: ReturnValue) -> Result<(), CommandSyntaxError> {
         if value.success_value() {
             self.count.fetch_add(1, Ordering::Relaxed);
         }
+        Ok(())
     }
 }
 

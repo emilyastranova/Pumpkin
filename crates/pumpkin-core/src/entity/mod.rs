@@ -6375,9 +6375,10 @@ impl Entity {
                 y.clamp(-MAX_VERTICAL_POSITION, MAX_VERTICAL_POSITION),
                 z.clamp(-MAX_HORIZONTAL_POSITION, MAX_HORIZONTAL_POSITION),
             );
+            // Sync state is left alone, like vanilla `Entity.load`, so the tracker sends
+            // changes made by `data modify entity`. A new tracker resets it on its own.
             if pos.x.is_finite() && pos.y.is_finite() && pos.z.is_finite() {
                 self.set_pos(pos);
-                self.last_sent_pos.store(pos);
             }
         }
         if let Some(velocity) = nbt.get_list("Motion")
@@ -6400,13 +6401,7 @@ impl Entity {
             let pitch = rotation[1].extract_float().unwrap_or(0.0);
             if yaw.is_finite() && pitch.is_finite() {
                 self.set_rotation(yaw, pitch);
-                // TODO: use `pumpkin_util::math::pack_degrees`.
-                let yaw_byte = (yaw * 256.0 / 360.0).rem_euclid(256.0) as u8;
-                let pitch_byte = (pitch * 256.0 / 360.0).rem_euclid(256.0) as u8;
-                self.last_sent_yaw.store(yaw_byte, Relaxed);
-                self.last_sent_pitch.store(pitch_byte, Relaxed);
                 self.head_yaw.store(yaw);
-                self.last_sent_head_yaw.store(yaw_byte, Relaxed);
             }
         }
     }

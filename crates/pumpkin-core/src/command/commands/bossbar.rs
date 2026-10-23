@@ -28,7 +28,7 @@ use crate::world::custom_bossbar::BossbarUpdateError;
 const DESCRIPTION: &str = "Creates and modifies boss bars";
 const PERMISSION: &str = "minecraft:command.bossbar";
 
-const ERROR_UNKNOWN_BOSSBAR: CommandErrorType<1> = CommandErrorType::new(
+pub const ERROR_UNKNOWN_BOSSBAR: CommandErrorType<1> = CommandErrorType::new(
     translation::java::COMMANDS_BOSSBAR_UNKNOWN,
     translation::bedrock::COMMANDS_BOSSBAR_NOTFOUND,
 );

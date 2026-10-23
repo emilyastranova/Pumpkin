@@ -171,8 +171,7 @@ fn test_type_specific(sub: &NbtCompound, entity: &dyn EntityBase) -> bool {
 
 /// Returns the items in the slot range named by `slot`, as item NBT.
 fn slot_items(entity: &dyn EntityBase, slot: &str) -> Vec<NbtCompound> {
-    let write =
-        |stack: &pumpkin_data::item_stack::ItemStack| stack.to_nbt().unwrap_or_default();
+    let write = |stack: &pumpkin_data::item_stack::ItemStack| stack.to_nbt().unwrap_or_default();
     match slot {
         "weapon" | "weapon.mainhand" => entity
             .get_living_entity()

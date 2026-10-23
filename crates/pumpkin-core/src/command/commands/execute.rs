@@ -1603,14 +1603,16 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
         )
         .then(
             literal("if")
-                .then(literal("predicate").then(
-                    argument("predicate", LootPredicateArgumentType)
-                        .fork(
-                            Redirection::Root,
-                            RedirectModifier::Custom(Arc::new(execute_if_predicate_modifier)),
-                        )
-                        .executes(ConditionalExecutor(execute_if_predicate_modifier)),
-                ))
+                .then(
+                    literal("predicate").then(
+                        argument("predicate", LootPredicateArgumentType)
+                            .fork(
+                                Redirection::Root,
+                                RedirectModifier::Custom(Arc::new(execute_if_predicate_modifier)),
+                            )
+                            .executes(ConditionalExecutor(execute_if_predicate_modifier)),
+                    ),
+                )
                 .then(
                     literal("entity").then(
                         argument("entities", EntityArgumentType::Entities)
@@ -1822,14 +1824,18 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
         )
         .then(
             literal("unless")
-                .then(literal("predicate").then(
-                    argument("predicate", LootPredicateArgumentType)
-                        .fork(
-                            Redirection::Root,
-                            RedirectModifier::Custom(Arc::new(execute_unless_predicate_modifier)),
-                        )
-                        .executes(ConditionalExecutor(execute_unless_predicate_modifier)),
-                ))
+                .then(
+                    literal("predicate").then(
+                        argument("predicate", LootPredicateArgumentType)
+                            .fork(
+                                Redirection::Root,
+                                RedirectModifier::Custom(Arc::new(
+                                    execute_unless_predicate_modifier,
+                                )),
+                            )
+                            .executes(ConditionalExecutor(execute_unless_predicate_modifier)),
+                    ),
+                )
                 .then(
                     literal("entity").then(
                         argument("entities", EntityArgumentType::Entities)

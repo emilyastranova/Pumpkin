@@ -1,3 +1,4 @@
+pub mod advancement;
 pub mod advancement_loader;
 pub mod context_provider_loader;
 pub mod damage_type_loader;
@@ -94,6 +95,7 @@ pub struct DatapackManager {
     item_modifiers: RwLock<HashMap<String, serde_json::Value>>,
     slot_sources: RwLock<HashMap<String, serde_json::Value>>,
     tags: RwLock<HashMap<String, HashMap<String, tag_loader::DynamicTagEntry>>>,
+    pub datapack_advancements: advancement::DatapackAdvancements,
 }
 
 fn share_function_bodies(
@@ -135,6 +137,7 @@ impl DatapackManager {
             item_modifiers: RwLock::new(HashMap::new()),
             slot_sources: RwLock::new(HashMap::new()),
             tags: RwLock::new(HashMap::new()),
+            datapack_advancements: advancement::DatapackAdvancements::default(),
         }
     }
 
@@ -214,6 +217,18 @@ impl DatapackManager {
         load_bundled_datapacks(enabled_packs, &mut acc, &mut loaded_packs_vec);
 
         let damage_type_registry = build_damage_type_registry(all_damage_type_defs);
+
+        let mut triggered_advancements = HashMap::new();
+        for pack in &loaded_packs_vec {
+            advancement::load_advancements_from_pack(&pack.root_path, &mut triggered_advancements);
+        }
+        if !triggered_advancements.is_empty() {
+            info!(
+                "Loaded {} datapack advancement(s)",
+                triggered_advancements.len()
+            );
+        }
+        self.datapack_advancements.set(triggered_advancements);
 
         recipe_manager.set_recipes(all_recipes);
         *self

@@ -4701,6 +4701,15 @@ impl EntityBase for LivingEntity {
                 server
                     .item_registry
                     .on_use_tick(item, caller, remaining_use_ticks);
+                // Vanilla fires `minecraft:using_item` from `ServerPlayer.updateUsingItem`.
+                if let Some(player) = caller.get_player()
+                    && !server.datapack_manager.datapack_advancements.is_empty()
+                    && let Some(p) = player.world().get_player_by_uuid(player.gameprofile.id)
+                {
+                    p.trigger_datapack_advancements(
+                        &crate::data::datapack::advancement::TriggerEvent::UsingItem(item),
+                    );
+                }
             }
         }
 

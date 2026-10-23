@@ -6,6 +6,7 @@ pub mod statistics;
 
 pub use client_move::{ClientMove, ClientMoveOutcome};
 
+use crate::data::datapack::advancement::TriggerEvent;
 use core::f32;
 use std::collections::{HashMap, VecDeque};
 use std::f64::consts::TAU;
@@ -3482,6 +3483,7 @@ impl Player {
                 crate::entity::player::advancement::trigger::AdvancementTrigger::Tick,
             );
         }
+        self.tick_datapack_advancements(server);
         if let Ok(mut adv) = self.advancements.try_lock() {
             adv.flush_dirty(self, true);
         }
@@ -7866,6 +7868,28 @@ impl Player {
             p.trigger_advancement(
                 crate::entity::player::advancement::trigger::AdvancementTrigger::InventoryChanged,
             );
+            p.trigger_datapack_advancements(&TriggerEvent::InventoryChanged);
+        }
+    }
+
+    /// Fires a criterion trigger for advancements loaded from datapacks.
+    pub fn trigger_datapack_advancements(self: &Arc<Self>, event: &TriggerEvent<'_>) {
+        if let Some(server) = self.world().server.upgrade()
+            && !server.datapack_manager.datapack_advancements.is_empty()
+        {
+            server
+                .datapack_manager
+                .datapack_advancements
+                .trigger(&server, self, event);
+        }
+    }
+
+    /// Vanilla fires `minecraft:tick` from `ServerPlayer.doTick` every tick.
+    fn tick_datapack_advancements(&self, server: &Server) {
+        if !server.datapack_manager.datapack_advancements.is_empty()
+            && let Some(p) = self.world().get_player_by_uuid(self.gameprofile.id)
+        {
+            p.trigger_datapack_advancements(&TriggerEvent::Tick);
         }
     }
 }

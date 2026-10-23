@@ -1019,6 +1019,21 @@ impl DatapackManager {
         ))
     }
 
+    /// Resolves a block tag to block ids, merging datapack entries with the built-in tag.
+    #[must_use]
+    pub fn resolve_block_tag(&self, tag: &str) -> Vec<u16> {
+        let tags = self
+            .tags
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ids = Vec::new();
+        let mut visited = Vec::new();
+        if let Some(block_tags) = tags.get("block") {
+            collect_block_tag(block_tags, tag, &mut ids, &mut visited);
+        }
+        ids
+    }
+
     pub fn get_function_names(&self) -> Vec<String> {
         let fns = self
             .functions
@@ -1656,6 +1671,47 @@ fn build_damage_type_registry(
     );
 
     damage_type_registry
+}
+
+fn normalize_id(id: &str) -> String {
+    if id.contains(':') {
+        id.to_string()
+    } else {
+        format!("minecraft:{id}")
+    }
+}
+
+fn collect_block_tag(
+    tags: &HashMap<String, tag_loader::DynamicTagEntry>,
+    tag: &str,
+    ids: &mut Vec<u16>,
+    visited: &mut Vec<String>,
+) {
+    let tag = normalize_id(tag);
+    if visited.contains(&tag) {
+        return;
+    }
+    if let Some(builtin) =
+        pumpkin_data::tag::get_tag_ids(pumpkin_data::tag::RegistryKey::Block, &tag).or_else(|| {
+            pumpkin_data::tag::get_tag_ids(
+                pumpkin_data::tag::RegistryKey::Block,
+                tag.strip_prefix("minecraft:").unwrap_or(&tag),
+            )
+        })
+    {
+        ids.extend_from_slice(builtin);
+    }
+    visited.push(tag.clone());
+    let Some(entry) = tags.get(&tag) else {
+        return;
+    };
+    for entry in &entry.values {
+        if let Some(nested) = entry.strip_prefix('#') {
+            collect_block_tag(tags, nested, ids, visited);
+        } else if let Some(block) = pumpkin_data::Block::from_name(&normalize_id(entry)) {
+            ids.push(block.id.as_u16());
+        }
+    }
 }
 
 struct PackContentAccumulators<'a> {

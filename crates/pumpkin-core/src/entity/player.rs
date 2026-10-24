@@ -3216,8 +3216,6 @@ impl Player {
         }
     }
 
-    /// Inbound packets go first, for all players, so every tick sees this tick's moves.
-    #[expect(clippy::too_many_lines)]
     /// Mirrors vanilla `rideTick` -> `positionRider` for a riding player: movement packets are
     /// ignored while riding, so the server-side position follows the vehicle instead. Without
     /// this, vehicles moved by commands (e.g. datapack cars) leave the player's chunk view and
@@ -3240,6 +3238,8 @@ impl Player {
         }
     }
 
+    /// Inbound packets go first, for all players, so every tick sees this tick's moves.
+    #[expect(clippy::too_many_lines)]
     pub fn tick<'a>(&'a self, server: &'a Server) {
         if let ClientPlatform::Bedrock(client) = self.client.as_ref() {
             client.tick_network_latency(self);

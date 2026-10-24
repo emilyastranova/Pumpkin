@@ -1093,7 +1093,7 @@ pub fn build() -> TokenStream {
         let Translate {
             translate,
             bedrock_translate: _,
-            with: _,
+            ..
         } = &*enchantment.description.0.content
         else {
             panic!()

@@ -6280,6 +6280,7 @@ impl Player {
                 translate,
                 bedrock_translate,
                 with,
+                ..
             } => {
                 let key = bedrock_translate.as_deref().unwrap_or(translate.as_ref());
                 let parameters = with

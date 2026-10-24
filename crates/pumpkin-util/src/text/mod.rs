@@ -1396,6 +1396,16 @@ impl TextComponent {
     /// Parses a text component from its NBT representation
     #[must_use]
     pub fn from_nbt(tag: &pumpkin_nbt::tag::NbtTag) -> Self {
+        // Datapacks made for 1.21.4 and older store components as JSON strings.
+        // Decode those instead of showing the raw JSON as literal text.
+        if let pumpkin_nbt::tag::NbtTag::String(value) = tag {
+            let trimmed = value.trim_start();
+            if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && let Ok(component) = serde_json::from_str::<Self>(value)
+            {
+                return component;
+            }
+        }
         Self::deserialize(nbt_de::TagDeserializer(tag)).unwrap_or_else(|_| Self::empty())
     }
 
@@ -2803,6 +2813,14 @@ mod custom_name_nbt_tests {
         name.put("extra", NbtTag::List(vec![NbtTag::Compound(inner)]));
         let component = TextComponent::from_nbt(&NbtTag::Compound(name));
         assert_eq!(component.get_text(), "Navigator");
+    }
+
+    #[test]
+    fn legacy_json_string_tag_is_decoded() {
+        let tag = NbtTag::String(r#"{"text":"Car","color":"blue","italic":false}"#.into());
+        let component = TextComponent::from_nbt(&tag);
+        assert!(component.0.style.color.is_some());
+        assert_eq!(component.get_text(), "Car");
     }
 
     #[test]

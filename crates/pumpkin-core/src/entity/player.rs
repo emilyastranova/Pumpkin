@@ -3218,6 +3218,28 @@ impl Player {
 
     /// Inbound packets go first, for all players, so every tick sees this tick's moves.
     #[expect(clippy::too_many_lines)]
+    /// Mirrors vanilla `rideTick` -> `positionRider` for a riding player: movement packets are
+    /// ignored while riding, so the server-side position follows the vehicle instead. Without
+    /// this, vehicles moved by commands (e.g. datapack cars) leave the player's chunk view and
+    /// entity tracking range behind.
+    fn follow_vehicle(&self) {
+        let entity = &self.living_entity.entity;
+        let Some(vehicle) = entity.get_vehicle() else {
+            return;
+        };
+        let vehicle_entity = vehicle.get_entity();
+        let vehicle_pos = vehicle_entity.pos.load();
+        let height = f64::from(vehicle_entity.entity_dimension.load().height);
+        let riding_pos = Vector3::new(vehicle_pos.x, vehicle_pos.y + height, vehicle_pos.z);
+        if entity.pos.load() == riding_pos {
+            return;
+        }
+        entity.set_pos(riding_pos);
+        if let Some(p) = self.world().get_player_by_uuid(self.gameprofile.id) {
+            crate::world::chunker::update_position(&p);
+        }
+    }
+
     pub fn tick<'a>(&'a self, server: &'a Server) {
         if let ClientPlatform::Bedrock(client) = self.client.as_ref() {
             client.tick_network_latency(self);
@@ -3256,6 +3278,8 @@ impl Player {
                 }
             }
         }
+
+        self.follow_vehicle();
 
         if let Ok(current_screen_handler_guard) = self.current_screen_handler.try_lock() {
             let current_screen_handler = current_screen_handler_guard.clone();
@@ -5050,6 +5074,11 @@ impl Player {
             ClientPlatform::Bedrock(client) => {
                 self.send_bedrock_teleport(client);
             }
+        }
+        // Vanilla `ServerPlayer.teleportTo` moves the player in the chunk map right away,
+        // so the destination loads without waiting for the client's next movement packet.
+        if let Some(player_arc) = self.world().get_player_by_uuid(self.gameprofile.id) {
+            crate::world::chunker::update_position(&player_arc);
         }
     }
 

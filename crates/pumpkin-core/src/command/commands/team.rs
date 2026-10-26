@@ -237,7 +237,7 @@ impl CommandExecutor for TeamJoinExecutor {
                 .map(|holder| holder.name)
                 .collect::<Vec<_>>()
         } else {
-            let sender_name = context.source.name.clone();
+            let sender_name = context.source.name();
             vec![sender_name]
         };
 
@@ -297,7 +297,7 @@ impl CommandExecutor for TeamLeaveExecutor {
                 .map(|holder| holder.name)
                 .collect::<Vec<_>>()
         } else {
-            let sender_name = context.source.name.clone();
+            let sender_name = context.source.name();
             vec![sender_name]
         };
 

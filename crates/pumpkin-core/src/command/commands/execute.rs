@@ -58,7 +58,6 @@ use crate::command::node::tree::Tree;
 use crate::command::node::{
     CommandExecutor, CommandExecutorResult, RedirectModifier, RedirectModifierResult, Redirection,
 };
-use crate::entity::EntityBase;
 use crate::entity::r#type::from_type;
 use crate::world::World;
 use crate::world::scoreboard::{NoTarget, Scoreboard, ScoreboardObjective, ScoreboardTarget};
@@ -95,12 +94,11 @@ fn execute_as_modifier(context: &CommandContext) -> crate::command::node::Redire
     let targets = EntityArgumentType::get_optional_entities(context, "targets")?;
     let mut sources = Vec::new();
     for target in targets {
-        let mut source = context.source.as_ref().clone();
-        let display_name = target.get_display_name();
-        let name = target.get_name().get_text();
-        source.entity = Some(target.clone());
-        source.name = name;
-        source.display_name = display_name;
+        let source = context
+            .source
+            .as_ref()
+            .clone()
+            .with_entity_names(target.clone());
         sources.push(Arc::new(source));
     }
     Ok(sources)
@@ -471,7 +469,12 @@ fn block_matches(context: &CommandContext) -> Result<bool, CommandSyntaxError> {
                 .source
                 .server
                 .as_ref()
-                .map(|server| server.datapack_manager.resolve_block_tag(&tag_name))
+                .map(|server| {
+                    server
+                        .datapack_manager
+                        .resolve_block_tag(&tag_name)
+                        .to_vec()
+                })
                 .unwrap_or_default(),
             tag_name,
             properties,
@@ -848,7 +851,7 @@ impl ReturnValueCallable for StoreData {
         let _ = (|| {
             let tag = self.number_type.create_tag(value, self.scale);
             self.accessor
-                .modify(&mut |root| self.path.set(root, tag.clone()))?;
+                .modify_at(&self.path, &mut |root| self.path.set(root, tag.clone()))?;
             Ok::<(), CommandSyntaxError>(())
         })();
         Ok(())
@@ -1292,14 +1295,15 @@ fn check_data_matches(
     } else if is_entity {
         let entity = EntityArgumentType::get_entity(context, "target")?;
         let accessor = EntityDataAccessor::new(entity);
-        let data = accessor.get_data()?;
-        path.count_matching(&NbtTag::Compound(data))
+        let mut count = 0;
+        accessor.read_at(path, &mut |root| count = path.count_matching(root))?;
+        count
     } else {
         let id = context.get_argument::<Identifier>("id")?;
         let server = context.server().clone();
         let accessor = StorageDataAccessor::new(id.to_string(), server);
         let mut count = 0;
-        accessor.read(&mut |root| count = path.count_matching(root))?;
+        accessor.read_at(path, &mut |root| count = path.count_matching(root))?;
         count
     };
     // Mirrors vanilla `checkMatchingData`: a missing path counts as zero matches, not an error.
@@ -1429,12 +1433,7 @@ fn execute_on_owner_modifier(
         if let Some(mob) = entity.get_mob() {
             if let Some(owner_uuid) = mob.get_owner_uuid() {
                 if let Some(owner) = world.get_player_by_uuid(owner_uuid) {
-                    let mut source = context.source.as_ref().clone();
-                    let name = owner.get_name().get_text();
-                    let display_name = owner.get_display_name();
-                    source.entity = Some(owner);
-                    source.name = name;
-                    source.display_name = display_name;
+                    let source = context.source.as_ref().clone().with_entity_names(owner);
                     sources.push(Arc::new(source));
                 }
             }
@@ -1449,12 +1448,7 @@ fn execute_on_leasher_modifier(
     let mut sources = Vec::new();
     if let Some(ref entity) = context.source.entity {
         if let Some(leasher) = entity.get_entity().get_leash_holder() {
-            let mut source = context.source.as_ref().clone();
-            let name = leasher.get_name().get_text();
-            let display_name = leasher.get_display_name();
-            source.entity = Some(leasher);
-            source.name = name;
-            source.display_name = display_name;
+            let source = context.source.as_ref().clone().with_entity_names(leasher);
             sources.push(Arc::new(source));
         }
     }
@@ -1468,12 +1462,7 @@ fn execute_on_target_modifier(
     if let Some(ref entity) = context.source.entity {
         if let Some(mob) = entity.get_mob() {
             if let Some(target) = mob.get_mob_entity().get_target() {
-                let mut source = context.source.as_ref().clone();
-                let name = target.get_name().get_text();
-                let display_name = target.get_display_name();
-                source.entity = Some(target);
-                source.name = name;
-                source.display_name = display_name;
+                let source = context.source.as_ref().clone().with_entity_names(target);
                 sources.push(Arc::new(source));
             }
         }
@@ -1489,12 +1478,7 @@ fn execute_on_attacker_modifier(
         if let Some(living) = entity.get_living_entity()
             && let Some(attacker) = living.get_last_hurt_by_mob()
         {
-            let mut source = context.source.as_ref().clone();
-            let name = attacker.get_name().get_text();
-            let display_name = attacker.get_display_name();
-            source.entity = Some(attacker);
-            source.name = name;
-            source.display_name = display_name;
+            let source = context.source.as_ref().clone().with_entity_names(attacker);
             sources.push(Arc::new(source));
         }
     }
@@ -1507,12 +1491,7 @@ fn execute_on_vehicle_modifier(
     let mut sources = Vec::new();
     if let Some(ref entity) = context.source.entity {
         if let Some(vehicle) = entity.get_entity().get_vehicle() {
-            let mut source = context.source.as_ref().clone();
-            let name = vehicle.get_name().get_text();
-            let display_name = vehicle.get_display_name();
-            source.entity = Some(vehicle);
-            source.name = name;
-            source.display_name = display_name;
+            let source = context.source.as_ref().clone().with_entity_names(vehicle);
             sources.push(Arc::new(source));
         }
     }
@@ -1532,12 +1511,11 @@ fn execute_on_controller_modifier(
             .first()
             .cloned()
         {
-            let mut source = context.source.as_ref().clone();
-            let name = controller.get_name().get_text();
-            let display_name = controller.get_display_name();
-            source.entity = Some(controller);
-            source.name = name;
-            source.display_name = display_name;
+            let source = context
+                .source
+                .as_ref()
+                .clone()
+                .with_entity_names(controller);
             sources.push(Arc::new(source));
         }
     }
@@ -1562,12 +1540,7 @@ fn execute_on_passengers_modifier(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         for passenger in passengers {
-            let mut source = context.source.as_ref().clone();
-            let name = passenger.get_name().get_text();
-            let display_name = passenger.get_display_name();
-            source.entity = Some(passenger);
-            source.name = name;
-            source.display_name = display_name;
+            let source = context.source.as_ref().clone().with_entity_names(passenger);
             sources.push(Arc::new(source));
         }
     }

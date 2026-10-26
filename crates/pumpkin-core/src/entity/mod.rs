@@ -128,6 +128,9 @@ const LEASH_RESTORE_TIMEOUT: i32 = 100;
 /// The maximum number of scoreboard tags an entity can carry, matching Vanilla.
 pub const MAX_SCOREBOARD_TAGS: usize = 1024;
 
+/// Root tags that `Entity::write_movement_nbt` writes and `read_nbt_non_mut` applies on their own.
+pub const MOVEMENT_NBT_KEYS: [&str; 3] = ["Pos", "Motion", "Rotation"];
+
 /// Push strength per axis in `Entity.push`.
 pub(crate) const PUSH_STRENGTH: f64 = 0.05f32 as f64;
 
@@ -280,6 +283,18 @@ pub trait EntityBase: Send + Sync + std::any::Any {
             },
             |mob| mob.mob_increase_air_supply(current),
         )
+    }
+
+    /// Calls `f` with a compound holding only the root tag `key`, matching what
+    /// `write_nbt` would put there. Returns false (without calling `f`) when this
+    /// entity can't produce that tag on its own.
+    fn read_root_nbt(&self, key: &str, f: &mut dyn FnMut(&NbtTag)) -> bool {
+        let mut nbt = NbtCompound::new();
+        if !self.get_entity().write_movement_nbt(key, &mut nbt) {
+            return false;
+        }
+        f(&NbtTag::Compound(nbt));
+        true
     }
 
     fn read_nbt_non_mut(&self, nbt: &NbtCompound) {
@@ -4442,6 +4457,15 @@ impl Entity {
         self.synched_data.set(tracked, value)
     }
 
+    /// Sets a tracked value and sends it even if it did not change.
+    pub fn set_synced_data_forced<T: MetadataSerializer + Clone + Send + Sync + 'static>(
+        &self,
+        tracked: pumpkin_data::tracked_data::TrackedData,
+        value: T,
+    ) {
+        self.synched_data.set_forced(tracked, value);
+    }
+
     pub fn send_bedrock_actor_data(&self, bedrock_meta: &SyncedActorDataList) {
         let world = self.world.load();
 
@@ -6271,36 +6295,44 @@ impl Entity {
 }
 
 impl Entity {
+    /// Writes `Pos`, `Motion` or `Rotation` as `write_nbt` does. Returns false for any other key.
+    pub fn write_movement_nbt(&self, key: &str, nbt: &mut NbtCompound) -> bool {
+        let tag = match key {
+            "Pos" => {
+                let position = self.pos.load();
+                // Vanilla saves a passenger at its vehicle's x and z.
+                let (x, z) = self
+                    .get_vehicle()
+                    .map_or((position.x, position.z), |vehicle| {
+                        let vehicle_pos = vehicle.get_entity().pos.load();
+                        (vehicle_pos.x, vehicle_pos.z)
+                    });
+                NbtTag::List(vec![x.into(), position.y.into(), z.into()])
+            }
+            "Motion" => {
+                let velocity = self.velocity.load();
+                NbtTag::List(vec![
+                    velocity.x.into(),
+                    velocity.y.into(),
+                    velocity.z.into(),
+                ])
+            }
+            "Rotation" => NbtTag::List(vec![self.yaw.load().into(), self.pitch.load().into()]),
+            _ => return false,
+        };
+        nbt.put(key, tag);
+        true
+    }
+
     pub fn write_nbt(&self, nbt: &mut NbtCompound) {
-        let position = self.pos.load();
         nbt.put_string(
             "id",
             format!("minecraft:{}", self.entity_type.resource_name),
         );
         nbt.put_uuid("UUID", self.entity_uuid);
-        let (x, z) = self
-            .get_vehicle()
-            .map_or((position.x, position.z), |vehicle| {
-                let vehicle_pos = vehicle.get_entity().pos.load();
-                (vehicle_pos.x, vehicle_pos.z)
-            });
-        nbt.put(
-            "Pos",
-            NbtTag::List(vec![x.into(), position.y.into(), z.into()]),
-        );
-        let velocity = self.velocity.load();
-        nbt.put(
-            "Motion",
-            NbtTag::List(vec![
-                velocity.x.into(),
-                velocity.y.into(),
-                velocity.z.into(),
-            ]),
-        );
-        nbt.put(
-            "Rotation",
-            NbtTag::List(vec![self.yaw.load().into(), self.pitch.load().into()]),
-        );
+        for key in MOVEMENT_NBT_KEYS {
+            self.write_movement_nbt(key, nbt);
+        }
         if self.entity_type != &EntityType::PLAYER {
             nbt.put_short("Air", self.air_supply.load(Relaxed) as i16);
         }

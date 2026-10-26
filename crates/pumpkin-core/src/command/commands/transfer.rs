@@ -46,7 +46,8 @@ fn transfer_players(
 
         info!(
             "[{}: Transferring {} to {hostname}:{port}]",
-            source.name, player.gameprofile.name
+            source.name(),
+            player.gameprofile.name
         );
         destinations
             .entry((hostname, port))

@@ -1056,6 +1056,30 @@ impl DatapackManager {
         ids
     }
 
+    /// Every datapack block tag resolved to block ids, for syncing tags to clients.
+    #[must_use]
+    pub fn block_tags_for_clients(&self) -> Vec<(String, Vec<u16>)> {
+        let tags = self
+            .tags
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(block_tags) = tags.get("block") else {
+            return Vec::new();
+        };
+        let mut resolved: Vec<_> = block_tags
+            .keys()
+            .map(|name| {
+                let mut ids = Vec::new();
+                collect_block_tag(block_tags, name, &mut ids, &mut Vec::new());
+                ids.sort_unstable();
+                ids.dedup();
+                (name.clone(), ids)
+            })
+            .collect();
+        resolved.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        resolved
+    }
+
     pub fn get_function_names(&self) -> Vec<String> {
         let fns = self
             .functions
@@ -2420,6 +2444,48 @@ fn load_recipes_from_dir(
 #[cfg(test)]
 mod tests {
     use super::DatapackManager;
+    use super::tag_loader::DynamicTagEntry;
+    use std::collections::HashMap;
+
+    fn resolve(tags: &HashMap<String, DynamicTagEntry>, tag: &str) -> Vec<u16> {
+        let mut ids = Vec::new();
+        super::collect_block_tag(tags, tag, &mut ids, &mut Vec::new());
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn block_tag(id: &str, values: &[&str]) -> (String, DynamicTagEntry) {
+        (
+            id.to_string(),
+            DynamicTagEntry {
+                id: id.to_string(),
+                values: values.iter().map(ToString::to_string).collect(),
+            },
+        )
+    }
+
+    #[test]
+    fn block_tags_resolve_nested_and_builtin() {
+        let stone = pumpkin_data::Block::STONE.id.as_u16();
+        let granite = pumpkin_data::Block::GRANITE.id.as_u16();
+        let mut tags: HashMap<String, DynamicTagEntry> = [
+            block_tag("test:stones", &["minecraft:stone"]),
+            block_tag("test:rocks", &["#test:stones", "granite", "#test:rocks"]),
+        ]
+        .into_iter()
+        .collect();
+        let mut expected = vec![stone, granite];
+        expected.sort_unstable();
+        assert_eq!(resolve(&tags, "test:rocks"), expected);
+
+        let builtin = resolve(&tags, "minecraft:dirt");
+        assert!(builtin.len() > 1);
+        tags.extend([block_tag("minecraft:dirt", &["stone"])]);
+        let extended = resolve(&tags, "minecraft:dirt");
+        assert!(extended.contains(&stone));
+        assert_eq!(extended.len(), builtin.len() + 1);
+    }
 
     #[test]
     fn function_dispatch_releases_the_functions_lock() {

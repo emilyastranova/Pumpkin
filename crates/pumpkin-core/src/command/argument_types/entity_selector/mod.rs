@@ -8,6 +8,7 @@ use crate::command::context::command_source::CommandSource;
 use crate::command::errors::command_syntax_error::CommandSyntaxError;
 use crate::entity::EntityBase;
 use crate::entity::player::Player;
+use crate::entity::tag_index;
 use crate::world::World;
 use pumpkin_data::Advancement;
 use pumpkin_data::entity::EntityType;
@@ -28,6 +29,9 @@ use uuid::Uuid;
 ///
 /// Not all selectors represented by this object start with `@`; this is also used for
 /// selectors like *plain player names* and *bare UUIDs*.
+/// Above this many candidates, a selector with a bounding box uses the spatial index.
+const MAX_BOXED_CANDIDATES: usize = 64;
+
 pub struct EntitySelector {
     /// The maximum number of possible entities that can be selected.
     pub max_selected: i32,
@@ -96,6 +100,36 @@ impl EntitySelector {
         &self,
         source: &CommandSource,
     ) -> Result<Vec<Arc<dyn EntityBase>>, CommandSyntaxError> {
+        self.find_entities_hinted(source, None)
+    }
+
+    /// Whether this selector already requires `tag`, so a tag hint cannot widen the search.
+    #[must_use]
+    pub fn requires_tag(&self, tag: &str) -> bool {
+        self.predicates
+            .iter()
+            .any(|predicate| matches!(predicate, EntitySelectorPredicate::Tag(name, false) if name == tag))
+    }
+
+    /// Like [`Self::find_entities`], for a caller that ignores every entity without
+    /// `tag` (e.g. `tag @e remove x`). Entities lacking the tag may still be returned,
+    /// but the search starts from the tag index instead of every entity in the world.
+    /// The hint is dropped for limited selectors, where it would change which entities
+    /// get picked.
+    pub fn find_entities_with_tag_hint(
+        &self,
+        source: &CommandSource,
+        tag: &str,
+    ) -> Result<Vec<Arc<dyn EntityBase>>, CommandSyntaxError> {
+        let hint = (self.max_selected == i32::MAX && !tag.is_empty()).then_some(tag);
+        self.find_entities_hinted(source, hint)
+    }
+
+    fn find_entities_hinted(
+        &self,
+        source: &CommandSource,
+        tag_hint: Option<&str>,
+    ) -> Result<Vec<Arc<dyn EntityBase>>, CommandSyntaxError> {
         self.check_permissions(source)?;
         if !self.includes_entities {
             self.find_players(source)
@@ -128,10 +162,16 @@ impl EntitySelector {
             } else {
                 let mut list = Vec::new();
                 if self.is_world_limited {
-                    self.add_entities(&mut list, source.world().as_ref(), bounding_box, &predicate);
+                    self.add_entities(
+                        &mut list,
+                        source.world().as_ref(),
+                        bounding_box,
+                        &predicate,
+                        tag_hint,
+                    );
                 } else {
                     for world in source.server().worlds.load().iter() {
-                        self.add_entities(&mut list, world, bounding_box, &predicate);
+                        self.add_entities(&mut list, world, bounding_box, &predicate, tag_hint);
                     }
                 }
 
@@ -146,13 +186,109 @@ impl EntitySelector {
         world: &World,
         bounding_box: Option<BoundingBox>,
         predicate: &EntitySelectorPredicate,
+        tag_hint: Option<&str>,
     ) {
         let limit = self.result_limit();
-        if let Some(b) = bounding_box {
+        if let Some(candidates) = self.candidate_entity_ids(world, tag_hint)
+            // A small box is already answered by the spatial index; only prefer the
+            // candidate list when it is short.
+            && (bounding_box.is_none() || candidates.len() <= MAX_BOXED_CANDIDATES)
+        {
+            world.extend_entities_from_candidates(list, limit, &candidates, bounding_box, |e| {
+                predicate.test(e)
+            });
+        } else if let Some(b) = bounding_box {
             world.extend_entities_in_box_where(list, limit, b, |e| predicate.test(e));
         } else {
             world.extend_entities_where(list, limit, |e| predicate.test(e));
         }
+    }
+
+    /// Returns the ids of the only non-player entities in `world` that can match this
+    /// selector, taken from the tag index (`tag=`) or the scoreboard (`scores=`),
+    /// whichever is smaller. `None` when neither narrows the search.
+    fn candidate_entity_ids(&self, world: &World, tag_hint: Option<&str>) -> Option<Vec<i32>> {
+        // Tags are only counted here; the winning tag's ids are copied out at the end,
+        // so a narrow `scores=` filter never pays for a wide tag's list.
+        let mut best_tag: Option<&str> = None;
+        let mut best: Option<Vec<i32>> = None;
+        let mut best_len = usize::MAX;
+        if let Some(tag) = tag_hint {
+            best_len = tag_index::count(tag);
+            best_tag = Some(tag);
+        }
+        for predicate in &self.predicates {
+            if let EntitySelectorPredicate::Tag(tag, false) = predicate
+                && !tag.is_empty()
+            {
+                let len = tag_index::count(tag);
+                if len < best_len {
+                    best_tag = Some(tag);
+                    best_len = len;
+                }
+            }
+        }
+        for predicate in &self.predicates {
+            let EntitySelectorPredicate::Scores(scores) = predicate else {
+                continue;
+            };
+            let lookup = world.entity_lookup();
+            let mut scoreboard = world
+                .scoreboard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (objective, bounds) in scores {
+                // An exact value (`scores={id=5}`) is answered by the scoreboard's value
+                // index instead of scanning every holder of the objective.
+                if let (Some(min), Some(max)) = (bounds.min(), bounds.max())
+                    && min == max
+                {
+                    let Some(holders) = scoreboard.holders_with_score(objective, min) else {
+                        return Some(Vec::new());
+                    };
+                    let mut ids: Vec<i32> = holders
+                        .filter_map(|holder| Uuid::try_parse(holder).ok())
+                        .filter_map(|uuid| lookup.get_by_uuid(&uuid))
+                        .map(|entity| entity.get_entity().entity_id)
+                        .collect();
+                    if ids.len() < best_len {
+                        ids.sort_unstable();
+                        best_len = ids.len();
+                        best = Some(ids);
+                        best_tag = None;
+                    }
+                    continue;
+                }
+                // A holder without a score in the objective never matches, so the
+                // objective's matching holders are a complete candidate set.
+                let Some(holders) = scoreboard.get_scores_for_objective(objective) else {
+                    return Some(Vec::new());
+                };
+                // Only the holders whose score is in range are candidates (e.g. the dozen
+                // parts of one car out of thousands), so measure those, not the objective.
+                let matching = holders
+                    .values()
+                    .filter(|score| bounds.matches(score.value.0))
+                    .count();
+                if matching >= best_len {
+                    continue;
+                }
+                let mut ids: Vec<i32> = holders
+                    .iter()
+                    .filter(|(_, score)| bounds.matches(score.value.0))
+                    .filter_map(|(holder, _)| Uuid::try_parse(holder).ok())
+                    .filter_map(|uuid| lookup.get_by_uuid(&uuid))
+                    .map(|entity| entity.get_entity().entity_id)
+                    .collect();
+                if ids.len() < best_len {
+                    ids.sort_unstable();
+                    best_len = ids.len();
+                    best = Some(ids);
+                    best_tag = None;
+                }
+            }
+        }
+        best_tag.map(tag_index::entities_with).or(best)
     }
 
     /// Tries to find a single player represented by this selector.
@@ -263,6 +399,9 @@ impl EntitySelector {
         if let Some(distance_bounds) = self.distance {
             list.push(EntitySelectorPredicate::Distance(distance_bounds, pos));
         }
+        // Every check is side-effect free, so run the cheap ones first and
+        // reject most entities before the scoreboard lookups or NBT writes.
+        list.sort_by_key(EntitySelectorPredicate::cost);
 
         EntitySelectorPredicate::new_all_of(list)
     }
@@ -471,6 +610,19 @@ fn entity_actual_name(entity: &dyn EntityBase) -> String {
 }
 
 impl EntitySelectorPredicate {
+    /// Rough relative cost of [`Self::test`], used to order a selector's checks.
+    const fn cost(&self) -> u8 {
+        match self {
+            Self::EntityType(..) | Self::IsAlive | Self::GameMode(..) => 0,
+            Self::BoundingBox(_) | Self::Distance(..) | Self::Rotation(..) => 1,
+            Self::Tag(..) | Self::ExperienceLevel(_) => 2,
+            Self::Name(..) | Self::Team(..) | Self::Advancements(_) => 3,
+            Self::Scores(_) => 4,
+            Self::AllOf(_) | Self::Predicate(..) => 5,
+            Self::Nbt(..) => 6,
+        }
+    }
+
     #[must_use]
     pub const fn new_all_of(predicates: Vec<Self>) -> Self {
         Self::AllOf(predicates)
@@ -518,11 +670,14 @@ impl EntitySelectorPredicate {
                     .scoreboard_tags
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains(expected_tag);
+                    // Entities carry a handful of tags, and datapack tags are long, so
+                    // comparing in place beats hashing the expected tag for every entity.
+                    .iter()
+                    .any(|tag| tag == expected_tag);
                 has_tag ^ invert
             }
             Self::Team(expected_team, invert) => {
-                let actual_name = entity_actual_name(entity);
+                let actual_name = entity.get_scoreboard_name();
                 let world = entity.get_entity().world.load();
                 let scoreboard = world
                     .scoreboard
@@ -534,22 +689,28 @@ impl EntitySelectorPredicate {
                 has_team ^ invert
             }
             Self::Scores(scores_map) => {
-                let actual_name = entity_actual_name(entity);
+                // Formats the holder name on the stack: this runs for every entity a
+                // datapack selector scans, so a heap string per entity adds up.
+                let mut uuid_buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                let actual_name: &str = match entity.get_player() {
+                    Some(player) => &player.gameprofile.name,
+                    None => entity
+                        .get_entity()
+                        .entity_uuid
+                        .hyphenated()
+                        .encode_lower(&mut uuid_buf),
+                };
                 let world = entity.get_entity().world.load();
                 let scoreboard = world
                     .scoreboard
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let entity_scores = scoreboard.get_scores().get(&actual_name);
-                for (objective, bounds) in scores_map {
-                    let score_val = entity_scores
-                        .and_then(|obj_map| obj_map.get(objective))
-                        .map_or(0, |score| score.value.0);
-                    if !bounds.matches(score_val) {
-                        return false;
-                    }
-                }
-                true
+                // Vanilla fails the selector when the holder has no score in the objective.
+                scores_map.iter().all(|(objective, bounds)| {
+                    scoreboard
+                        .get_score(actual_name, objective)
+                        .is_some_and(|score| bounds.matches(score.value.0))
+                })
             }
             Self::Advancements(advancements_map) => {
                 let Some(player) = entity.get_player() else {
@@ -568,8 +729,8 @@ impl EntitySelectorPredicate {
                 true
             }
             Self::Nbt(expected_nbt, invert) => {
-                let mut actual_nbt = NbtCompound::default();
-                entity.write_nbt(&mut actual_nbt);
+                let actual_nbt =
+                    crate::command::commands::data::entity_nbt_with_selected_item(entity);
                 matches_nbt_compound(expected_nbt, &actual_nbt) ^ invert
             }
             Self::Predicate(predicate_id, invert) => {

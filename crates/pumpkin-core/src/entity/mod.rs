@@ -50,8 +50,8 @@ use pumpkin_protocol::{
     codec::var_int::VarInt,
     codec::var_ulong::VarULong,
     java::client::play::{
-        CEntityPositionSync, CEntityVelocity, CPlayerPosition, CSetEntityMetadata, CSetPassengers,
-        CSpawnEntity, Metadata, MetadataSerializer,
+        CEntityVelocity, CPlayerPosition, CSetEntityMetadata, CSetPassengers, CSpawnEntity,
+        Metadata, MetadataSerializer,
     },
 };
 use pumpkin_util::math::vector3::Axis;
@@ -106,6 +106,7 @@ pub mod projectile_deflection;
 pub mod shearable;
 pub mod spawn_util;
 pub mod synched_entity_data;
+pub mod tag_index;
 pub mod tnt;
 pub mod r#type;
 pub mod vehicle;
@@ -126,6 +127,9 @@ const LEASH_RESTORE_TIMEOUT: i32 = 100;
 
 /// The maximum number of scoreboard tags an entity can carry, matching Vanilla.
 pub const MAX_SCOREBOARD_TAGS: usize = 1024;
+
+/// Root tags that `Entity::write_movement_nbt` writes and `read_nbt_non_mut` applies on their own.
+pub const MOVEMENT_NBT_KEYS: [&str; 3] = ["Pos", "Motion", "Rotation"];
 
 /// Push strength per axis in `Entity.push`.
 pub(crate) const PUSH_STRENGTH: f64 = 0.05f32 as f64;
@@ -279,6 +283,18 @@ pub trait EntityBase: Send + Sync + std::any::Any {
             },
             |mob| mob.mob_increase_air_supply(current),
         )
+    }
+
+    /// Calls `f` with a compound holding only the root tag `key`, matching what
+    /// `write_nbt` would put there. Returns false (without calling `f`) when this
+    /// entity can't produce that tag on its own.
+    fn read_root_nbt(&self, key: &str, f: &mut dyn FnMut(&NbtTag)) -> bool {
+        let mut nbt = NbtCompound::new();
+        if !self.get_entity().write_movement_nbt(key, &mut nbt) {
+            return false;
+        }
+        f(&NbtTag::Compound(nbt));
+        true
     }
 
     fn read_nbt_non_mut(&self, nbt: &NbtCompound) {
@@ -1803,6 +1819,18 @@ impl Collision {
     }
 }
 
+impl Drop for Entity {
+    fn drop(&mut self) {
+        let tags = self
+            .scoreboard_tags
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for tag in tags.iter() {
+            tag_index::remove(tag, self.entity_id);
+        }
+    }
+}
+
 impl Entity {
     #[must_use]
     pub fn get_server(&self) -> Option<std::sync::Arc<Server>> {
@@ -2178,17 +2206,27 @@ impl Entity {
             .scoreboard_tags
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tags.len() < MAX_SCOREBOARD_TAGS && tags.insert(tag.to_owned())
+        let added = tags.len() < MAX_SCOREBOARD_TAGS && tags.insert(tag.to_owned());
+        drop(tags);
+        if added {
+            tag_index::insert(tag, self.entity_id);
+        }
+        added
     }
 
     /// Removes a scoreboard tag from this entity.
     ///
     /// Returns `false` if the entity did not have the tag.
     pub fn remove_scoreboard_tag(&self, tag: &str) -> bool {
-        self.scoreboard_tags
+        let removed = self
+            .scoreboard_tags
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(tag)
+            .remove(tag);
+        if removed {
+            tag_index::remove(tag, self.entity_id);
+        }
+        removed
     }
 
     /// Sets a custom name for the entity, typically used with nametags
@@ -4419,6 +4457,15 @@ impl Entity {
         self.synched_data.set(tracked, value)
     }
 
+    /// Sets a tracked value and sends it even if it did not change.
+    pub fn set_synced_data_forced<T: MetadataSerializer + Clone + Send + Sync + 'static>(
+        &self,
+        tracked: pumpkin_data::tracked_data::TrackedData,
+        value: T,
+    ) {
+        self.synched_data.set_forced(tracked, value);
+    }
+
     pub fn send_bedrock_actor_data(&self, bedrock_meta: &SyncedActorDataList) {
         let world = self.world.load();
 
@@ -4820,7 +4867,7 @@ impl Entity {
         position: Vector3<f64>,
         yaw: Option<f32>,
         pitch: Option<f32>,
-        world: &World,
+        _world: &World,
     ) {
         // Update server-side position and bounding box
         self.set_pos(position);
@@ -4830,31 +4877,52 @@ impl Entity {
         if let Some(pitch) = pitch {
             self.set_pitch(pitch);
         }
-        // Update cache so we don't send rubberbanding deltas
-        self.last_sent_pos.store(position);
-        // TODO: use `pumpkin_util::math::pack_degrees`.
-        if let Some(yaw) = yaw {
-            self.last_sent_yaw
-                .store((yaw * 256.0 / 360.0).rem_euclid(256.0) as u8, Relaxed);
-            self.last_sent_head_yaw
-                .store((yaw * 256.0 / 360.0).rem_euclid(256.0) as u8, Relaxed);
+        // Vanilla `teleportTo` carries the passengers along (`teleportPassengers`).
+        // Nothing is sent here: like vanilla, the tracker (`ServerEntity.sendChanges`) syncs
+        // the final position on its next update. Sending every teleport would leak
+        // intermediate positions, e.g. a datapack that teleports away and back in the same
+        // tick, which makes the client snap instead of interpolating.
+        self.position_riders();
+        // Vanilla `sendTeleportTransitionToPlayers`: players riding the entity always get the
+        // teleport, because the client drives its own vehicle and would otherwise move it
+        // back with its next `MoveVehicle` packet.
+        self.send_teleport_to_riders();
+    }
+
+    fn send_teleport_to_riders(&self) {
+        let mut riders = Vec::new();
+        self.collect_player_riders(&mut riders);
+        if riders.is_empty() {
+            return;
         }
-        if let Some(pitch) = pitch {
-            self.last_sent_pitch
-                .store((pitch * 256.0 / 360.0).rem_euclid(256.0) as u8, Relaxed);
-        }
-        let chunk_pos = self.chunk_pos.load();
-        world.broadcast_to_chunk(
-            chunk_pos,
-            &CEntityPositionSync::new(
-                self.entity_id.into(),
-                position,
-                self.velocity.load(),
-                yaw.unwrap_or(self.yaw.load()),
-                pitch.unwrap_or(self.pitch.load()),
-                self.on_ground.load(Ordering::SeqCst),
-            ),
+        let packet = pumpkin_protocol::java::client::play::CTeleportEntity::new(
+            self.entity_id.into(),
+            self.pos.load(),
+            Vector3::new(0.0, 0.0, 0.0),
+            self.yaw.load(),
+            self.pitch.load(),
+            &[],
+            self.on_ground.load(Ordering::SeqCst),
         );
+        for rider in riders {
+            if let Some(player) = rider.get_player() {
+                player.try_send_client_packet(&packet);
+            }
+        }
+    }
+
+    fn collect_player_riders(&self, out: &mut Vec<Arc<dyn EntityBase>>) {
+        let passengers = self
+            .passengers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for passenger in passengers {
+            passenger.get_entity().collect_player_riders(out);
+            if passenger.get_player().is_some() {
+                out.push(passenger);
+            }
+        }
     }
 
     pub fn get_eye_pos(&self) -> Vector3<f64> {
@@ -5532,6 +5600,30 @@ impl Entity {
             stack,
         );
         world.spawn_entity(Arc::new(item_entity));
+    }
+
+    /// Mirrors vanilla `Entity.positionRider` with the default attachments: each non-player
+    /// passenger sits at the vehicle's position raised by the vehicle's height. Players stay
+    /// client authoritative.
+    pub fn position_riders(&self) {
+        let passengers = self
+            .passengers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if passengers.is_empty() {
+            return;
+        }
+        let pos = self.pos.load();
+        let height = f64::from(self.entity_dimension.load().height);
+        let riding_pos = Vector3::new(pos.x, pos.y + height, pos.z);
+        for passenger in passengers {
+            let passenger_entity = passenger.get_entity();
+            if passenger.get_player().is_none() {
+                passenger_entity.set_pos(riding_pos);
+            }
+            passenger_entity.position_riders();
+        }
     }
 
     pub fn has_passengers(&self) -> bool {
@@ -6243,36 +6335,44 @@ impl Entity {
 }
 
 impl Entity {
+    /// Writes `Pos`, `Motion` or `Rotation` as `write_nbt` does. Returns false for any other key.
+    pub fn write_movement_nbt(&self, key: &str, nbt: &mut NbtCompound) -> bool {
+        let tag = match key {
+            "Pos" => {
+                let position = self.pos.load();
+                // Vanilla saves a passenger at its vehicle's x and z.
+                let (x, z) = self
+                    .get_vehicle()
+                    .map_or((position.x, position.z), |vehicle| {
+                        let vehicle_pos = vehicle.get_entity().pos.load();
+                        (vehicle_pos.x, vehicle_pos.z)
+                    });
+                NbtTag::List(vec![x.into(), position.y.into(), z.into()])
+            }
+            "Motion" => {
+                let velocity = self.velocity.load();
+                NbtTag::List(vec![
+                    velocity.x.into(),
+                    velocity.y.into(),
+                    velocity.z.into(),
+                ])
+            }
+            "Rotation" => NbtTag::List(vec![self.yaw.load().into(), self.pitch.load().into()]),
+            _ => return false,
+        };
+        nbt.put(key, tag);
+        true
+    }
+
     pub fn write_nbt(&self, nbt: &mut NbtCompound) {
-        let position = self.pos.load();
         nbt.put_string(
             "id",
             format!("minecraft:{}", self.entity_type.resource_name),
         );
         nbt.put_uuid("UUID", self.entity_uuid);
-        let (x, z) = self
-            .get_vehicle()
-            .map_or((position.x, position.z), |vehicle| {
-                let vehicle_pos = vehicle.get_entity().pos.load();
-                (vehicle_pos.x, vehicle_pos.z)
-            });
-        nbt.put(
-            "Pos",
-            NbtTag::List(vec![x.into(), position.y.into(), z.into()]),
-        );
-        let velocity = self.velocity.load();
-        nbt.put(
-            "Motion",
-            NbtTag::List(vec![
-                velocity.x.into(),
-                velocity.y.into(),
-                velocity.z.into(),
-            ]),
-        );
-        nbt.put(
-            "Rotation",
-            NbtTag::List(vec![self.yaw.load().into(), self.pitch.load().into()]),
-        );
+        for key in MOVEMENT_NBT_KEYS {
+            self.write_movement_nbt(key, nbt);
+        }
         if self.entity_type != &EntityType::PLAYER {
             nbt.put_short("Air", self.air_supply.load(Relaxed) as i16);
         }
@@ -6349,9 +6449,10 @@ impl Entity {
                 y.clamp(-MAX_VERTICAL_POSITION, MAX_VERTICAL_POSITION),
                 z.clamp(-MAX_HORIZONTAL_POSITION, MAX_HORIZONTAL_POSITION),
             );
+            // Sync state is left alone, like vanilla `Entity.load`, so the tracker sends
+            // changes made by `data modify entity`. A new tracker resets it on its own.
             if pos.x.is_finite() && pos.y.is_finite() && pos.z.is_finite() {
                 self.set_pos(pos);
-                self.last_sent_pos.store(pos);
             }
         }
         if let Some(velocity) = nbt.get_list("Motion")
@@ -6374,13 +6475,7 @@ impl Entity {
             let pitch = rotation[1].extract_float().unwrap_or(0.0);
             if yaw.is_finite() && pitch.is_finite() {
                 self.set_rotation(yaw, pitch);
-                // TODO: use `pumpkin_util::math::pack_degrees`.
-                let yaw_byte = (yaw * 256.0 / 360.0).rem_euclid(256.0) as u8;
-                let pitch_byte = (pitch * 256.0 / 360.0).rem_euclid(256.0) as u8;
-                self.last_sent_yaw.store(yaw_byte, Relaxed);
-                self.last_sent_pitch.store(pitch_byte, Relaxed);
                 self.head_yaw.store(yaw);
-                self.last_sent_head_yaw.store(yaw_byte, Relaxed);
             }
         }
     }
@@ -6451,7 +6546,9 @@ impl Entity {
                 .scoreboard_tags
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tags.clear();
+            for tag in tags.drain() {
+                tag_index::remove(&tag, self.entity_id);
+            }
             if let Some(tag_list) = nbt.get_list("Tags") {
                 tags.extend(
                     tag_list
@@ -6459,6 +6556,9 @@ impl Entity {
                         .filter_map(|tag| tag.extract_string().map(str::to_owned))
                         .take(MAX_SCOREBOARD_TAGS),
                 );
+            }
+            for tag in tags.iter() {
+                tag_index::insert(tag, self.entity_id);
             }
         }
 

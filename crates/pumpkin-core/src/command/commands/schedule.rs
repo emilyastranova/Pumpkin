@@ -71,7 +71,7 @@ impl SuggestionProvider for ScheduleSuggestionProvider {
 }
 
 fn execute_schedule(context: &CommandContext, replace: bool) -> Result<i32, CommandSyntaxError> {
-    let function_name = StringArgumentType::get(context, "function")?.to_string();
+    let function_name = FunctionArgumentType::get(context, "function")?.to_string();
     let time = TimeArgumentType::get(context, "time")?;
 
     if time == 0 {

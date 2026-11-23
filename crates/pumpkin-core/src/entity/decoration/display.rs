@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicI8, AtomicI32, AtomicU8, Ordering},
 };
 
-use pumpkin_data::{damage::DamageType, item_stack::ItemStack};
+use pumpkin_data::{Block, BlockStateId, damage::DamageType, item_stack::ItemStack};
 use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
 use pumpkin_protocol::{
     codec::{item_stack_seralizer::ItemStackSerializer, var_int::VarInt},
@@ -97,7 +97,8 @@ impl DisplayEntity {
     pub fn set_interpolation_start_delta_ticks(&self, ticks: i32) {
         self.interpolation_start_delta_ticks
             .store(ticks, Ordering::Relaxed);
-        self.entity.set_synced_data(
+        // Vanilla forces this one so the client restarts the interpolation every time.
+        self.entity.set_synced_data_forced(
             pumpkin_data::tracked_data::display::START_INTERPOLATION,
             VarInt(ticks),
         );
@@ -558,8 +559,7 @@ impl DisplayEntity {
             self.interpolation_duration.store(dur, Ordering::Relaxed);
         }
         if let Some(start) = nbt.get_int("start_interpolation") {
-            self.interpolation_start_delta_ticks
-                .store(start, Ordering::Relaxed);
+            self.set_interpolation_start_delta_ticks(start);
         }
         if let Some(vr) = nbt.get_float("view_range") {
             *self
@@ -611,6 +611,32 @@ impl DisplayEntity {
                 .store((sky << 4) | (block & 0xF), Ordering::Relaxed);
         }
 
+        if let Some(matrix) = nbt
+            .get_list("transformation")
+            .filter(|list| list.len() == 16)
+        {
+            let m: Vec<f32> = matrix
+                .iter()
+                .map(|v| v.extract_float().unwrap_or(0.0))
+                .collect();
+            let (translation, left_rotation, scale) = decompose_affine(&m);
+            *self
+                .translation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = translation;
+            *self
+                .scale
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = scale;
+            *self
+                .left_rotation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = left_rotation;
+            *self
+                .right_rotation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = [0.0, 0.0, 0.0, 1.0];
+        }
         if let Some(transform) = nbt.get_compound("transformation") {
             if let Some(t_list) = transform.get_list("translation")
                 && t_list.len() >= 3
@@ -662,6 +688,30 @@ impl DisplayEntity {
     }
 }
 
+/// Writes a block state the way vanilla's `BlockState.CODEC` does: `{Name:..,Properties:{..}}`.
+fn block_state_to_nbt(state: i32) -> NbtCompound {
+    let id = BlockStateId::new_or_air(u16::try_from(state).unwrap_or(0));
+    let block = Block::from_state_id(id);
+    let mut comp = NbtCompound::new();
+    let name = if block.name.contains(':') {
+        block.name.to_string()
+    } else {
+        format!("minecraft:{}", block.name)
+    };
+    comp.put_string("Name", name);
+    if let Some(props) = block.properties(id) {
+        let props = props.to_props();
+        if !props.is_empty() {
+            let mut props_comp = NbtCompound::new();
+            for p in props {
+                props_comp.put_string(p.key_str(), p.value_str().to_string());
+            }
+            comp.put_compound("Properties", props_comp);
+        }
+    }
+    comp
+}
+
 pub struct BlockDisplayEntity {
     pub display: DisplayEntity,
     pub block_state: AtomicI32,
@@ -691,12 +741,21 @@ impl BlockDisplayEntity {
 impl EntityBase for BlockDisplayEntity {
     fn write_custom_nbt(&self, nbt: &mut NbtCompound) {
         self.display.write_display_nbt(nbt);
-        nbt.put_int("block_state", self.block_state.load(Ordering::Relaxed));
+        nbt.put_compound(
+            "block_state",
+            block_state_to_nbt(self.block_state.load(Ordering::Relaxed)),
+        );
     }
 
     fn read_custom_nbt(&self, nbt: &NbtCompound) {
         self.display.read_display_nbt(nbt);
-        if let Some(state) = nbt.get_int("block_state") {
+        // Vanilla stores `{Name:..,Properties:{..}}`; older Pumpkin saves used the raw id.
+        let state = match nbt.get("block_state") {
+            Some(NbtTag::Int(id)) => Some(*id),
+            Some(tag) => crate::command::commands::particle::block_state_id(tag).map(i32::from),
+            None => None,
+        };
+        if let Some(state) = state {
             self.block_state.store(state, Ordering::Relaxed);
         }
     }
@@ -754,7 +813,12 @@ impl EntityBase for BlockDisplayEntity {
 
 pub struct ItemDisplayEntity {
     pub display: DisplayEntity,
-    pub item_stack: Mutex<ItemStack>,
+    item_stack: Mutex<ItemStack>,
+    /// `{item: ...}` as saved, built on first read and dropped whenever the item
+    /// changes. Datapacks read data out of a display's item many times a tick (e.g.
+    /// `data get entity @s item.components."minecraft:custom_data"`), and saving the
+    /// whole stack each time costs far more than the read itself.
+    item_root_nbt: Mutex<Option<Arc<NbtTag>>>,
     pub item_display: AtomicU8,
 }
 
@@ -763,6 +827,7 @@ impl ItemDisplayEntity {
         Arc::new(Self {
             display: DisplayEntity::new(entity),
             item_stack: Mutex::new(ItemStack::new(0, &pumpkin_data::item::Item::AIR)),
+            item_root_nbt: Mutex::new(None),
             item_display: AtomicU8::new(0),
         })
     }
@@ -779,10 +844,41 @@ impl ItemDisplayEntity {
             .item_stack
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = item.clone();
+        self.invalidate_item_nbt();
         self.display.entity.set_synced_data(
             pumpkin_data::tracked_data::item_display::ITEM,
             ItemStackSerializer::from(item),
         );
+    }
+
+    fn invalidate_item_nbt(&self) {
+        *self
+            .item_root_nbt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// The saved `{item: ...}` compound, from the cache when the item hasn't changed.
+    fn item_root_nbt(&self) -> Arc<NbtTag> {
+        let mut cached = self
+            .item_root_nbt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(root) = cached.as_ref() {
+            return root.clone();
+        }
+        let mut nbt = NbtCompound::new();
+        let item = self
+            .item_stack
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(item_compound) = item.to_nbt() {
+            nbt.put_compound("item", item_compound);
+        }
+        drop(item);
+        let root = Arc::new(NbtTag::Compound(nbt));
+        *cached = Some(root.clone());
+        root
     }
 
     pub fn get_item_display_mode(&self) -> u8 {
@@ -798,6 +894,19 @@ impl ItemDisplayEntity {
 }
 
 impl EntityBase for ItemDisplayEntity {
+    fn read_root_nbt(&self, key: &str, f: &mut dyn FnMut(&NbtTag)) -> bool {
+        if key != "item" {
+            let mut nbt = NbtCompound::new();
+            if !self.display.entity.write_movement_nbt(key, &mut nbt) {
+                return false;
+            }
+            f(&NbtTag::Compound(nbt));
+            return true;
+        }
+        f(&self.item_root_nbt());
+        true
+    }
+
     fn write_custom_nbt(&self, nbt: &mut NbtCompound) {
         self.display.write_display_nbt(nbt);
         let display_mode_str = match self.item_display.load(Ordering::Relaxed) {
@@ -812,10 +921,24 @@ impl EntityBase for ItemDisplayEntity {
             _ => "none",
         };
         nbt.put_string("item_display", display_mode_str.to_string());
+        if let NbtTag::Compound(root) = self.item_root_nbt().as_ref()
+            && let Some(item) = root.get_compound("item")
+        {
+            nbt.put_compound("item", item.clone());
+        }
     }
 
     fn read_custom_nbt(&self, nbt: &NbtCompound) {
         self.display.read_display_nbt(nbt);
+        if let Some(item_compound) = nbt.get_compound("item")
+            && let Some(stack) = ItemStack::read_item_stack(item_compound)
+        {
+            *self
+                .item_stack
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = stack;
+            self.invalidate_item_nbt();
+        }
         if let Some(mode_str) = nbt.get_string("item_display") {
             let mode = match mode_str {
                 "thirdperson_lefthand" => 1,
@@ -1185,4 +1308,63 @@ impl EntityBase for TextDisplayEntity {
     ) -> bool {
         false
     }
+}
+
+/// Splits a row-major 4x4 affine matrix (the list form of vanilla's `transformation`)
+/// into translation, rotation quaternion and per-axis scale. Vanilla runs a full SVD;
+/// this covers rotation-times-scale matrices, including the all-zero "hidden" matrix.
+fn decompose_affine(m: &[f32]) -> (Vector3<f32>, [f32; 4], Vector3<f32>) {
+    let translation = Vector3::new(m[3], m[7], m[11]);
+    let column = |c: usize| [m[c], m[4 + c], m[8 + c]];
+    let mut r = [[0.0f32; 3]; 3];
+    let mut scale = [0.0f32; 3];
+    for c in 0..3 {
+        let col = column(c);
+        let len = (col[0] * col[0] + col[1] * col[1] + col[2] * col[2]).sqrt();
+        scale[c] = len;
+        for row in 0..3 {
+            r[row][c] = if len > f32::EPSILON {
+                col[row] / len
+            } else if row == c {
+                1.0
+            } else {
+                0.0
+            };
+        }
+    }
+    let trace = r[0][0] + r[1][1] + r[2][2];
+    let q = if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        [
+            (r[2][1] - r[1][2]) / s,
+            (r[0][2] - r[2][0]) / s,
+            (r[1][0] - r[0][1]) / s,
+            0.25 * s,
+        ]
+    } else if r[0][0] > r[1][1] && r[0][0] > r[2][2] {
+        let s = (1.0 + r[0][0] - r[1][1] - r[2][2]).sqrt() * 2.0;
+        [
+            0.25 * s,
+            (r[0][1] + r[1][0]) / s,
+            (r[0][2] + r[2][0]) / s,
+            (r[2][1] - r[1][2]) / s,
+        ]
+    } else if r[1][1] > r[2][2] {
+        let s = (1.0 + r[1][1] - r[0][0] - r[2][2]).sqrt() * 2.0;
+        [
+            (r[0][1] + r[1][0]) / s,
+            0.25 * s,
+            (r[1][2] + r[2][1]) / s,
+            (r[0][2] - r[2][0]) / s,
+        ]
+    } else {
+        let s = (1.0 + r[2][2] - r[0][0] - r[1][1]).sqrt() * 2.0;
+        [
+            (r[0][2] + r[2][0]) / s,
+            (r[1][2] + r[2][1]) / s,
+            0.25 * s,
+            (r[1][0] - r[0][1]) / s,
+        ]
+    };
+    (translation, q, Vector3::new(scale[0], scale[1], scale[2]))
 }

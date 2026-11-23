@@ -1,3 +1,4 @@
+pub mod advancement;
 pub mod advancement_loader;
 pub mod context_provider_loader;
 pub mod damage_type_loader;
@@ -29,6 +30,7 @@ use pumpkin_protocol::codec::recipe::DynamicRecipe;
 use pumpkin_util::loot_table::DynamicLootTable;
 
 use crate::command::context::command_source::CommandSource;
+use crate::command::dispatcher::CommandDispatcher;
 use crate::server::Server;
 use crate::server::recipe::RecipeManager;
 use crate::world::loot::LootTableHandle;
@@ -82,6 +84,8 @@ pub struct DatapackManager {
     loaded_packs: RwLock<Vec<LoadedDatapack>>,
     functions: RwLock<HashMap<String, Arc<[String]>>>,
     function_tags: RwLock<HashMap<String, Vec<String>>>,
+    /// Flattened block tags, filled on first use and cleared when packs reload.
+    resolved_block_tags: RwLock<HashMap<String, Arc<[u16]>>>,
     test_instances: RwLock<TestInstanceRegistry>,
     context_int_providers: RwLock<ContextProviderRegistry>,
     context_float_providers: RwLock<ContextProviderRegistry>,
@@ -95,6 +99,7 @@ pub struct DatapackManager {
     item_modifiers: RwLock<HashMap<String, serde_json::Value>>,
     slot_sources: RwLock<HashMap<String, serde_json::Value>>,
     tags: RwLock<HashMap<String, HashMap<String, tag_loader::DynamicTagEntry>>>,
+    pub datapack_advancements: advancement::DatapackAdvancements,
 }
 
 fn share_function_bodies(
@@ -119,6 +124,7 @@ impl DatapackManager {
             loaded_packs: RwLock::new(Vec::new()),
             functions: RwLock::new(HashMap::new()),
             function_tags: RwLock::new(HashMap::new()),
+            resolved_block_tags: RwLock::new(HashMap::new()),
             test_instances: RwLock::new(HashMap::new()),
             context_int_providers: RwLock::new(HashMap::new()),
             context_float_providers: RwLock::new(HashMap::new()),
@@ -136,6 +142,7 @@ impl DatapackManager {
             item_modifiers: RwLock::new(HashMap::new()),
             slot_sources: RwLock::new(HashMap::new()),
             tags: RwLock::new(HashMap::new()),
+            datapack_advancements: advancement::DatapackAdvancements::default(),
         }
     }
 
@@ -216,6 +223,18 @@ impl DatapackManager {
 
         let damage_type_registry = build_damage_type_registry(all_damage_type_defs);
 
+        let mut triggered_advancements = HashMap::new();
+        for pack in &loaded_packs_vec {
+            advancement::load_advancements_from_pack(&pack.root_path, &mut triggered_advancements);
+        }
+        if !triggered_advancements.is_empty() {
+            info!(
+                "Loaded {} datapack advancement(s)",
+                triggered_advancements.len()
+            );
+        }
+        self.datapack_advancements.set(triggered_advancements);
+
         recipe_manager.set_recipes(all_recipes);
         *self
             .loaded_packs
@@ -230,6 +249,10 @@ impl DatapackManager {
             .function_tags
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = all_function_tags;
+        self.resolved_block_tags
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         *self
             .test_instances
             .write()
@@ -1005,6 +1028,59 @@ impl DatapackManager {
         ))
     }
 
+    /// Resolves a block tag to block ids, merging datapack entries with the built-in tag.
+    #[must_use]
+    pub fn resolve_block_tag(&self, tag: &str) -> Arc<[u16]> {
+        if let Some(ids) = self
+            .resolved_block_tags
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(tag)
+        {
+            return ids.clone();
+        }
+        let tags = self
+            .tags
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ids = Vec::new();
+        let mut visited = Vec::new();
+        if let Some(block_tags) = tags.get("block") {
+            collect_block_tag(block_tags, tag, &mut ids, &mut visited);
+        }
+        drop(tags);
+        let ids: Arc<[u16]> = ids.into();
+        self.resolved_block_tags
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(tag.to_string(), ids.clone());
+        ids
+    }
+
+    /// Every datapack block tag resolved to block ids, for syncing tags to clients.
+    #[must_use]
+    pub fn block_tags_for_clients(&self) -> Vec<(String, Vec<u16>)> {
+        let tags = self
+            .tags
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(block_tags) = tags.get("block") else {
+            return Vec::new();
+        };
+        let mut resolved: Vec<_> = block_tags
+            .keys()
+            .map(|name| {
+                let mut ids = Vec::new();
+                collect_block_tag(block_tags, name, &mut ids, &mut Vec::new());
+                ids.sort_unstable();
+                ids.dedup();
+                (name.clone(), ids)
+            })
+            .collect();
+        resolved.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        resolved
+    }
+
     pub fn get_function_names(&self) -> Vec<String> {
         let fns = self
             .functions
@@ -1022,58 +1098,141 @@ impl DatapackManager {
         names
     }
 
+    /// Returns the functions a `#tag` name expands to, or `None` for a plain function name or an
+    /// unknown tag.
+    pub fn function_tag_members(&self, name: &str) -> Option<Vec<String>> {
+        let tag_name = name.strip_prefix('#')?;
+        self.function_tags
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(tag_name)
+            .cloned()
+    }
+
     pub fn execute_function(
         &self,
         server: &Arc<Server>,
         source: &CommandSource,
         name: &str,
     ) -> Result<usize, String> {
-        self.visit_function_lines(name, |line| {
-            server
-                .command_dispatcher
-                .load()
-                .handle_command(source, line);
-        })
+        self.execute_function_with(server, source, name, None)
+            .map(|result| result.executed)
     }
 
+    /// Runs a function (or function tag), substituting macro lines with `arguments`.
+    ///
+    /// Each function runs in its own frame so `return` only stops that function.
+    pub fn execute_function_with(
+        &self,
+        server: &Arc<Server>,
+        source: &CommandSource,
+        name: &str,
+        arguments: Option<&NbtCompound>,
+    ) -> Result<FunctionResult, String> {
+        let source = Arc::new(source.clone().with_silent());
+        self.execute_function_with_source(server, &source, name, arguments)
+    }
+
+    /// Like [`Self::execute_function_with`], for a caller that already shares the source.
+    pub fn execute_function_with_source(
+        &self,
+        server: &Arc<Server>,
+        source: &Arc<CommandSource>,
+        name: &str,
+        arguments: Option<&NbtCompound>,
+    ) -> Result<FunctionResult, String> {
+        let functions = self.resolve_functions(name)?;
+        let dispatcher = server.command_dispatcher.load();
+        // Vanilla runs function bodies with suppressed output (`withSuppressedOutput`).
+        // Calls from inside a function are already silent, so reuse their source.
+        let source = if source.silent {
+            Arc::clone(source)
+        } else {
+            Arc::new(source.as_ref().clone().with_silent())
+        };
+        // Players can change permissions at any time, so only fixed senders reuse parses.
+        let permission_key = match source.output {
+            crate::command::CommandSender::Console => Some(0),
+            crate::command::CommandSender::CommandBlock(..)
+            | crate::command::CommandSender::Dummy => Some(1),
+            crate::command::CommandSender::Player(_) => None,
+        };
+        let mut result = FunctionResult::default();
+        for lines in functions.iter() {
+            let has_macro_lines = lines.iter().any(|line| line.starts_with('$'));
+            let macro_arguments = if has_macro_lines {
+                let Some(arguments) = arguments else {
+                    return Err(format!("Function {name} is a macro and needs arguments"));
+                };
+                Some(arguments)
+            } else {
+                None
+            };
+
+            FUNCTION_FRAMES.with_borrow_mut(|frames| frames.push(FunctionFrame::default()));
+            // Plain lines reuse the parse of the line itself; macro lines are
+            // rewritten per call, so they never hit the parse cache.
+            if let Some(arguments) = macro_arguments {
+                for line in lines.iter() {
+                    let text = substitute_macro(line.strip_prefix('$').unwrap_or(line), arguments)?;
+                    if Self::run_function_line(&dispatcher, &text, &source, None, &mut result) {
+                        break;
+                    }
+                }
+            } else {
+                for line in lines.iter() {
+                    if Self::run_function_line(
+                        &dispatcher,
+                        line,
+                        &source,
+                        permission_key,
+                        &mut result,
+                    ) {
+                        break;
+                    }
+                }
+            }
+            FUNCTION_FRAMES.with_borrow_mut(Vec::pop);
+        }
+        Ok(result)
+    }
+
+    /// Runs one function line and reports whether it ended the function with `return`.
+    fn run_function_line(
+        dispatcher: &CommandDispatcher,
+        line: &str,
+        source: &Arc<CommandSource>,
+        permission_key: Option<u8>,
+        result: &mut FunctionResult,
+    ) -> bool {
+        let line_result = permission_key.map_or_else(
+            || dispatcher.execute(dispatcher.parse_input(line, source)),
+            |key| dispatcher.execute_input_cached_arc(line, source, key),
+        );
+        result.executed += 1;
+        let returned = FUNCTION_FRAMES.with_borrow_mut(|frames| {
+            let frame = frames.last_mut()?;
+            if frame.return_run {
+                frame.return_run = false;
+                frame.returned = Some(*line_result.as_ref().unwrap_or(&0));
+            }
+            frame.returned
+        });
+        if let Some(value) = returned {
+            result.returned = Some(result.returned.unwrap_or(0) + value);
+            return true;
+        }
+        false
+    }
+
+    #[cfg(test)]
     fn visit_function_lines(
         &self,
         name: &str,
         mut visit: impl FnMut(&str),
     ) -> Result<usize, String> {
-        let (functions_to_run, is_tag) = if let Some(tag_name) = name.strip_prefix('#') {
-            let tags = self
-                .function_tags
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(fns) = tags.get(tag_name) else {
-                return Err(format!("Unknown function tag: #{tag_name}"));
-            };
-            (fns.clone(), true)
-        } else {
-            (vec![name.to_string()], false)
-        };
-
-        let functions = {
-            let all_fns = self
-                .functions
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut functions = Vec::with_capacity(functions_to_run.len());
-            for fn_id in functions_to_run {
-                let Some(lines) = all_fns.get(&fn_id) else {
-                    if !is_tag {
-                        return Err(format!("Unknown function: {fn_id}"));
-                    }
-                    continue;
-                };
-                functions.push(Arc::clone(lines));
-            }
-            functions
-        };
-
         let mut total_executed = 0;
-        for lines in functions {
+        for lines in self.resolve_functions(name)?.iter() {
             for line in lines.iter() {
                 visit(line);
                 total_executed += 1;
@@ -1081,6 +1240,33 @@ impl DatapackManager {
         }
 
         Ok(total_executed)
+    }
+
+    fn resolve_functions(&self, name: &str) -> Result<FunctionBodies, String> {
+        let all_fns = self
+            .functions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tag_name) = name.strip_prefix('#') {
+            let tags = self
+                .function_tags
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(ids) = tags.get(tag_name) else {
+                return Err(format!("Unknown function tag: #{tag_name}"));
+            };
+            let mut bodies = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(lines) = all_fns.get(id) {
+                    bodies.push(Arc::clone(lines));
+                }
+            }
+            return Ok(FunctionBodies::Many(bodies));
+        }
+        let Some(lines) = all_fns.get(name) else {
+            return Err(format!("Unknown function: {name}"));
+        };
+        Ok(FunctionBodies::One(Arc::clone(lines)))
     }
 
     #[must_use]
@@ -1442,6 +1628,104 @@ impl DatapackManager {
     }
 }
 
+/// Outcome of running a function or function tag.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FunctionResult {
+    /// Number of command lines that ran.
+    pub executed: usize,
+    /// Sum of the values passed to `return`, if any function returned.
+    pub returned: Option<i32>,
+}
+
+/// The bodies a function name resolves to.
+///
+/// A plain `function ns:path` is the common case in every datapack loop, so it
+/// avoids building a list; tags keep it for their many bodies.
+enum FunctionBodies {
+    One(Arc<[String]>),
+    Many(Vec<Arc<[String]>>),
+}
+
+impl FunctionBodies {
+    fn iter(&self) -> std::slice::Iter<'_, Arc<[String]>> {
+        match self {
+            Self::One(body) => std::slice::from_ref(body).iter(),
+            Self::Many(bodies) => bodies.iter(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct FunctionFrame {
+    returned: Option<i32>,
+    return_run: bool,
+}
+
+thread_local! {
+    // Functions run synchronously on the calling thread, nested calls included.
+    static FUNCTION_FRAMES: std::cell::RefCell<Vec<FunctionFrame>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Makes the innermost running function stop after the current line with `value`.
+pub fn return_from_function(value: i32) {
+    FUNCTION_FRAMES.with_borrow_mut(|frames| {
+        if let Some(frame) = frames.last_mut() {
+            frame.returned = Some(value);
+        }
+    });
+}
+
+/// Makes the innermost running function return the result of the current line.
+pub fn return_run_from_function() {
+    FUNCTION_FRAMES.with_borrow_mut(|frames| {
+        if let Some(frame) = frames.last_mut() {
+            frame.return_run = true;
+        }
+    });
+}
+
+/// Mirrors `MacroFunction.stringify`.
+fn stringify_macro_argument(tag: &NbtTag) -> String {
+    fn decimal(value: f64) -> String {
+        let text = format!("{value:.15}");
+        let text = text.trim_end_matches('0').trim_end_matches('.');
+        if text == "-0" {
+            "-0".to_string()
+        } else {
+            text.to_string()
+        }
+    }
+    match tag {
+        NbtTag::Float(v) => decimal(f64::from(*v)),
+        NbtTag::Double(v) => decimal(*v),
+        NbtTag::Byte(v) => v.to_string(),
+        NbtTag::Short(v) => v.to_string(),
+        NbtTag::Long(v) => v.to_string(),
+        NbtTag::String(v) => v.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn substitute_macro(template: &str, arguments: &NbtCompound) -> Result<String, String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("$(") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find(')') else {
+            return Err(format!("Unterminated macro argument in: {template}"));
+        };
+        let key = &after[..end];
+        let Some(value) = arguments.get(key) else {
+            return Err(format!("Missing macro argument '{key}'"));
+        };
+        out.push_str(&stringify_macro_argument(value));
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 fn parse_structure_resource_location(resource_location: &str) -> Result<(&str, &str), String> {
     let (namespace, raw_path) = resource_location
         .split_once(':')
@@ -1526,6 +1810,47 @@ fn build_damage_type_registry(
     );
 
     damage_type_registry
+}
+
+fn normalize_id(id: &str) -> String {
+    if id.contains(':') {
+        id.to_string()
+    } else {
+        format!("minecraft:{id}")
+    }
+}
+
+fn collect_block_tag(
+    tags: &HashMap<String, tag_loader::DynamicTagEntry>,
+    tag: &str,
+    ids: &mut Vec<u16>,
+    visited: &mut Vec<String>,
+) {
+    let tag = normalize_id(tag);
+    if visited.contains(&tag) {
+        return;
+    }
+    if let Some(builtin) =
+        pumpkin_data::tag::get_tag_ids(pumpkin_data::tag::RegistryKey::Block, &tag).or_else(|| {
+            pumpkin_data::tag::get_tag_ids(
+                pumpkin_data::tag::RegistryKey::Block,
+                tag.strip_prefix("minecraft:").unwrap_or(&tag),
+            )
+        })
+    {
+        ids.extend_from_slice(builtin);
+    }
+    visited.push(tag.clone());
+    let Some(entry) = tags.get(&tag) else {
+        return;
+    };
+    for entry in &entry.values {
+        if let Some(nested) = entry.strip_prefix('#') {
+            collect_block_tag(tags, nested, ids, visited);
+        } else if let Some(block) = pumpkin_data::Block::from_name(&normalize_id(entry)) {
+            ids.push(block.id.as_u16());
+        }
+    }
 }
 
 struct PackContentAccumulators<'a> {
@@ -2177,6 +2502,48 @@ fn load_recipes_from_dir(
 #[cfg(test)]
 mod tests {
     use super::DatapackManager;
+    use super::tag_loader::DynamicTagEntry;
+    use std::collections::HashMap;
+
+    fn resolve(tags: &HashMap<String, DynamicTagEntry>, tag: &str) -> Vec<u16> {
+        let mut ids = Vec::new();
+        super::collect_block_tag(tags, tag, &mut ids, &mut Vec::new());
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn block_tag(id: &str, values: &[&str]) -> (String, DynamicTagEntry) {
+        (
+            id.to_string(),
+            DynamicTagEntry {
+                id: id.to_string(),
+                values: values.iter().map(ToString::to_string).collect(),
+            },
+        )
+    }
+
+    #[test]
+    fn block_tags_resolve_nested_and_builtin() {
+        let stone = pumpkin_data::Block::STONE.id.as_u16();
+        let granite = pumpkin_data::Block::GRANITE.id.as_u16();
+        let mut tags: HashMap<String, DynamicTagEntry> = [
+            block_tag("test:stones", &["minecraft:stone"]),
+            block_tag("test:rocks", &["#test:stones", "granite", "#test:rocks"]),
+        ]
+        .into_iter()
+        .collect();
+        let mut expected = vec![stone, granite];
+        expected.sort_unstable();
+        assert_eq!(resolve(&tags, "test:rocks"), expected);
+
+        let builtin = resolve(&tags, "minecraft:dirt");
+        assert!(builtin.len() > 1);
+        tags.extend([block_tag("minecraft:dirt", &["stone"])]);
+        let extended = resolve(&tags, "minecraft:dirt");
+        assert!(extended.contains(&stone));
+        assert_eq!(extended.len(), builtin.len() + 1);
+    }
 
     #[test]
     fn function_dispatch_releases_the_functions_lock() {

@@ -6,6 +6,7 @@ pub mod statistics;
 
 pub use client_move::{ClientMove, ClientMoveOutcome};
 
+use crate::data::datapack::advancement::TriggerEvent;
 use core::f32;
 use std::collections::{HashMap, VecDeque};
 use std::f64::consts::TAU;
@@ -3215,6 +3216,28 @@ impl Player {
         }
     }
 
+    /// Mirrors vanilla `rideTick` -> `positionRider` for a riding player: movement packets are
+    /// ignored while riding, so the server-side position follows the vehicle instead. Without
+    /// this, vehicles moved by commands (e.g. datapack cars) leave the player's chunk view and
+    /// entity tracking range behind.
+    fn follow_vehicle(&self) {
+        let entity = &self.living_entity.entity;
+        let Some(vehicle) = entity.get_vehicle() else {
+            return;
+        };
+        let vehicle_entity = vehicle.get_entity();
+        let vehicle_pos = vehicle_entity.pos.load();
+        let height = f64::from(vehicle_entity.entity_dimension.load().height);
+        let riding_pos = Vector3::new(vehicle_pos.x, vehicle_pos.y + height, vehicle_pos.z);
+        if entity.pos.load() == riding_pos {
+            return;
+        }
+        entity.set_pos(riding_pos);
+        if let Some(p) = self.world().get_player_by_uuid(self.gameprofile.id) {
+            crate::world::chunker::update_position(&p);
+        }
+    }
+
     /// Inbound packets go first, for all players, so every tick sees this tick's moves.
     #[expect(clippy::too_many_lines)]
     pub fn tick<'a>(&'a self, server: &'a Server) {
@@ -3255,6 +3278,8 @@ impl Player {
                 }
             }
         }
+
+        self.follow_vehicle();
 
         if let Ok(current_screen_handler_guard) = self.current_screen_handler.try_lock() {
             let current_screen_handler = current_screen_handler_guard.clone();
@@ -3482,6 +3507,7 @@ impl Player {
                 crate::entity::player::advancement::trigger::AdvancementTrigger::Tick,
             );
         }
+        self.tick_datapack_advancements(server);
         if let Ok(mut adv) = self.advancements.try_lock() {
             adv.flush_dirty(self, true);
         }
@@ -5049,6 +5075,11 @@ impl Player {
                 self.send_bedrock_teleport(client);
             }
         }
+        // Vanilla `ServerPlayer.teleportTo` moves the player in the chunk map right away,
+        // so the destination loads without waiting for the client's next movement packet.
+        if let Some(player_arc) = self.world().get_player_by_uuid(self.gameprofile.id) {
+            crate::world::chunker::update_position(&player_arc);
+        }
     }
 
     /// `MovePlayer` at the current position and rotation, for the own client and watchers
@@ -6278,6 +6309,7 @@ impl Player {
                 translate,
                 bedrock_translate,
                 with,
+                ..
             } => {
                 let key = bedrock_translate.as_deref().unwrap_or(translate.as_ref());
                 let parameters = with
@@ -7866,6 +7898,28 @@ impl Player {
             p.trigger_advancement(
                 crate::entity::player::advancement::trigger::AdvancementTrigger::InventoryChanged,
             );
+            p.trigger_datapack_advancements(&TriggerEvent::InventoryChanged);
+        }
+    }
+
+    /// Fires a criterion trigger for advancements loaded from datapacks.
+    pub fn trigger_datapack_advancements(self: &Arc<Self>, event: &TriggerEvent<'_>) {
+        if let Some(server) = self.world().server.upgrade()
+            && !server.datapack_manager.datapack_advancements.is_empty()
+        {
+            server
+                .datapack_manager
+                .datapack_advancements
+                .trigger(&server, self, event);
+        }
+    }
+
+    /// Vanilla fires `minecraft:tick` from `ServerPlayer.doTick` every tick.
+    fn tick_datapack_advancements(&self, server: &Server) {
+        if !server.datapack_manager.datapack_advancements.is_empty()
+            && let Some(p) = self.world().get_player_by_uuid(self.gameprofile.id)
+        {
+            p.trigger_datapack_advancements(&TriggerEvent::Tick);
         }
     }
 }

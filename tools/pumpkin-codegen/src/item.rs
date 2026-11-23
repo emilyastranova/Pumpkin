@@ -372,7 +372,7 @@ impl ToTokens for ItemComponents {
         let TextContent::Translate {
             translate: text,
             bedrock_translate: _,
-            with: _,
+            ..
         } = *self.item_name.clone().0.content
         else {
             unreachable!()

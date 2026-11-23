@@ -895,6 +895,80 @@ mod tests {
         assert!(value.equal(&restored));
     }
 
+    /// Data pack JSON turns whole numbers into ints and decimals into doubles, and
+    /// vanilla's codecs accept any numeric type and fill in optional fields.
+    #[test]
+    fn components_read_any_number_type_and_vanilla_defaults() {
+        let mut effect = NbtCompound::new();
+        effect.put_string("id", "minecraft:regeneration".to_string());
+        effect.put_int("duration", 96);
+        let mut apply = NbtCompound::new();
+        apply.put_string("type", "minecraft:apply_effects".to_string());
+        apply.put_list("effects", vec![NbtTag::Compound(effect)]);
+        let mut consumable = NbtCompound::new();
+        consumable.put_double("consume_seconds", 0.8);
+        consumable.put_list("on_consume_effects", vec![NbtTag::Compound(apply)]);
+        let consumable =
+            ConsumableImpl::read_data(&NbtTag::Compound(consumable)).expect("consumable");
+        assert!((consumable.consume_seconds - 0.8).abs() < f32::EPSILON);
+        assert_eq!(consumable.animation, ConsumeAnimation::Eat);
+        assert!(consumable.consume_particles);
+        let [ConsumeEffect::ApplyEffects((effects, probability))] = &*consumable.effects else {
+            panic!("expected one apply_effects entry");
+        };
+        assert!((probability - 1.0).abs() < f32::EPSILON);
+        assert_eq!(effects[0].amplifier, 0);
+        assert!(effects[0].show_particles && effects[0].show_icon && !effects[0].ambient);
+
+        let mut food = NbtCompound::new();
+        food.put_int("nutrition", 4);
+        food.put_int("saturation", 2);
+        assert!(FoodImpl::read_data(&NbtTag::Compound(food)).is_some());
+
+        let mut modifier = NbtCompound::new();
+        modifier.put_string("type", "minecraft:attack_damage".to_string());
+        modifier.put_string("id", "attack_damage".to_string());
+        modifier.put_int("amount", 8);
+        modifier.put_string("operation", "add_value".to_string());
+        modifier.put_string("slot", "mainhand".to_string());
+        let modifiers =
+            AttributeModifiersImpl::read_data(&NbtTag::List(vec![NbtTag::Compound(modifier)]))
+                .expect("attribute modifiers");
+        assert!((modifiers.attribute_modifiers[0].amount - 8.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn styled_names_and_lore_keep_their_text() {
+        let mut line = NbtCompound::new();
+        line.put_string("translate", "desc.kleispack.armour".to_string());
+        line.put_string("color", "dark_green".to_string());
+        let line = NbtTag::Compound(line);
+
+        let lore = LoreImpl::read_data(&NbtTag::List(vec![
+            line.clone(),
+            NbtTag::String("plain".into()),
+        ]))
+        .expect("lore");
+        assert_eq!(lore.lines.len(), 2);
+        let NbtTag::List(written) = lore.write_data() else {
+            panic!("lore writes a list");
+        };
+        assert_eq!(
+            written[0]
+                .extract_compound()
+                .and_then(|line| line.get_string("translate")),
+            Some("desc.kleispack.armour")
+        );
+
+        let name = CustomNameImpl::read_data(&line).expect("custom name");
+        assert_eq!(
+            name.write_data()
+                .extract_compound()
+                .and_then(|name| name.get_string("color")),
+            Some("dark_green")
+        );
+    }
+
     #[test]
     fn max_damage_round_trip() {
         assert_round_trip(MaxDamageImpl { max_damage: 1561 }, MaxDamageImpl::read_data);

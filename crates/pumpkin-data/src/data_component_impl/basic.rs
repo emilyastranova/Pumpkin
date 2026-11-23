@@ -112,14 +112,14 @@ pub struct CustomNameImpl {
 }
 impl CustomNameImpl {
     pub fn read_data(data: &NbtTag) -> Option<Self> {
-        data.extract_string().map(|name| Self {
-            name: TextComponent::text(name.to_string()),
+        Some(Self {
+            name: read_text_component(data)?,
         })
     }
 }
 impl DataComponentImpl for CustomNameImpl {
     fn write_data(&self) -> NbtTag {
-        NbtTag::String(self.name.clone().get_text().into())
+        write_text_component(&self.name)
     }
     fn get_hash(&self) -> i32 {
         get_str_hash(self.name.clone().get_text().as_str()) as i32
@@ -192,20 +192,14 @@ impl LoreImpl {
         Some(Self {
             lines: lines
                 .iter()
-                .filter_map(NbtTag::extract_string)
-                .map(|line| TextComponent::text(line.to_owned()))
-                .collect(),
+                .map(read_text_component)
+                .collect::<Option<_>>()?,
         })
     }
 }
 impl DataComponentImpl for LoreImpl {
     fn write_data(&self) -> NbtTag {
-        NbtTag::List(
-            self.lines
-                .iter()
-                .map(|line| NbtTag::String(line.clone().get_text().into_boxed_str()))
-                .collect(),
-        )
+        NbtTag::List(self.lines.iter().map(write_text_component).collect())
     }
     default_impl!(Lore);
 }
@@ -925,4 +919,21 @@ impl SoundEvent {
     pub const fn new(sound_name: String, range: Option<f32>) -> Self {
         Self { sound_name, range }
     }
+}
+
+/// Reads a text component stored as NBT: a plain string or a component compound or list,
+/// like vanilla `ComponentSerialization.CODEC`.
+fn read_text_component(data: &NbtTag) -> Option<TextComponent> {
+    match data {
+        NbtTag::String(text) => Some(TextComponent::text(text.to_string())),
+        NbtTag::Compound(_) | NbtTag::List(_) => Some(TextComponent::from_nbt(data)),
+        _ => None,
+    }
+}
+
+/// Writes a text component as NBT, keeping its translation keys and style.
+fn write_text_component(component: &TextComponent) -> NbtTag {
+    component
+        .0
+        .to_nbt_tag_for_version(&pumpkin_util::version::JavaMinecraftVersion::V_26_3)
 }

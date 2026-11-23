@@ -480,6 +480,7 @@ impl Server {
 
         info!("All worlds loaded successfully.");
 
+        crate::data::datapack::DatapackManager::enable_new_world_packs(&server);
         let enabled_packs = server.level_info.load().data_packs.enabled.clone();
         server
             .datapack_manager

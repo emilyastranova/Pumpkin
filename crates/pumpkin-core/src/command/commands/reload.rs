@@ -27,6 +27,7 @@ impl CommandExecutor for ReloadExecutor {
         );
 
         let server = context.server().clone();
+        crate::data::datapack::DatapackManager::enable_new_world_packs(&server);
         server.reload_datapacks(&server);
 
         Ok(0)

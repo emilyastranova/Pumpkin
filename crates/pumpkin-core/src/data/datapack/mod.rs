@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use pumpkin_data::damage::DamageType;
 use pumpkin_data::registry::RegistryEntryData;
@@ -1107,27 +1107,9 @@ impl DatapackManager {
             }
         }
 
-        // World datapacks directory.
-        let datapacks_dir = server.basic_config.get_world_path().join("datapacks");
-        if let Ok(entries) = fs::read_dir(datapacks_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let file_name = entry.file_name().to_string_lossy().to_string();
-
-                if file_name.starts_with('.') {
-                    continue;
-                }
-
-                if path.is_dir()
-                    || path
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
-                {
-                    let pack_name = format!("file/{file_name}");
-                    if !packs.iter().any(|p| p == &pack_name) {
-                        packs.push(pack_name);
-                    }
-                }
+        for pack_name in world_pack_names(&server.basic_config.get_world_path()) {
+            if !packs.iter().any(|p| p == &pack_name) {
+                packs.push(pack_name);
             }
         }
 
@@ -1164,6 +1146,40 @@ impl DatapackManager {
         }
 
         packs
+    }
+
+    /// Enables packs in the world's `datapacks` directory that the world neither
+    /// enables nor disables yet, like vanilla's `MinecraftServer.configurePackRepository`
+    /// on startup and `ReloadCommand.discoverNewPacks` on `/reload`.
+    pub fn enable_new_world_packs(server: &Server) {
+        let level_info = server.level_info.load();
+        let new_packs: Vec<String> = world_pack_names(&server.basic_config.get_world_path())
+            .into_iter()
+            .filter(|pack| {
+                !level_info.data_packs.enabled.contains(pack)
+                    && !level_info.data_packs.disabled.contains(pack)
+            })
+            .collect();
+        drop(level_info);
+        if new_packs.is_empty() {
+            return;
+        }
+
+        for pack in &new_packs {
+            info!("Found new data pack {pack}, loading it automatically");
+        }
+        server.level_info.rcu(|level_info| {
+            let mut new_info = (**level_info).clone();
+            for pack in &new_packs {
+                if !new_info.data_packs.enabled.contains(pack) {
+                    new_info.data_packs.enabled.push(pack.clone());
+                }
+            }
+            new_info
+        });
+        if let Err(err) = server.save_world_info() {
+            error!("Failed to save world info: {err}");
+        }
     }
 
     pub fn get_available_packs(server: &Server) -> Vec<String> {
@@ -1640,6 +1656,31 @@ fn load_bundled_datapacks(
             });
         }
     }
+}
+
+/// Pack ids (`file/<name>`) of the folders and zip files in the world's `datapacks` directory.
+fn world_pack_names(world_path: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(world_path.join("datapacks")) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().to_string();
+
+        if file_name.starts_with('.') {
+            continue;
+        }
+
+        if path.is_dir()
+            || path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
+            names.push(format!("file/{file_name}"));
+        }
+    }
+    names
 }
 
 fn scan_datapacks_dir(

@@ -184,9 +184,7 @@ impl AttributeModifiersImpl {
             let type_name = comp.get_string("type")?;
             let r#type = attribute_from_name(type_name)?;
             let id = Cow::Owned(comp.get_string("id")?.to_string());
-            let amount = comp
-                .get_double("amount")
-                .or_else(|| comp.get_float("amount").map(f64::from))?;
+            let amount = comp.get_numeric_double("amount")?;
             let operation = Operation::from_name(comp.get_string("operation")?)?;
             let slot = comp
                 .get_string("slot")
@@ -1007,11 +1005,11 @@ impl BlocksAttacksImpl {
             return Some(Self::DEFAULT);
         };
         let block_delay_seconds = compound
-            .get_float("block_delay_seconds")
+            .get_numeric_float("block_delay_seconds")
             .unwrap_or(0.0)
             .max(0.0);
         let disable_cooldown_scale = compound
-            .get_float("disable_cooldown_scale")
+            .get_numeric_float("disable_cooldown_scale")
             .unwrap_or(1.0)
             .max(0.0);
         let damage_reductions = if let Some(list) = compound.get_list("damage_reductions") {
@@ -1020,11 +1018,11 @@ impl BlocksAttacksImpl {
                 let c = item.extract_compound()?;
                 reductions.push(DamageReduction {
                     horizontal_blocking_angle: c
-                        .get_float("horizontal_blocking_angle")
+                        .get_numeric_float("horizontal_blocking_angle")
                         .unwrap_or(90.0),
                     damage_type: c.get("type").and_then(IDSet::<DamageType>::read),
-                    base: c.get_float("base")?,
-                    factor: c.get_float("factor")?,
+                    base: c.get_numeric_float("base")?,
+                    factor: c.get_numeric_float("factor")?,
                 });
             }
             Cow::Owned(reductions)
@@ -1033,9 +1031,9 @@ impl BlocksAttacksImpl {
         };
         let item_damage = if let Some(c) = compound.get_compound("item_damage") {
             ItemDamageFunction {
-                threshold: c.get_float("threshold")?.max(0.0),
-                base: c.get_float("base")?,
-                factor: c.get_float("factor")?,
+                threshold: c.get_numeric_float("threshold")?.max(0.0),
+                base: c.get_numeric_float("base")?,
+                factor: c.get_numeric_float("factor")?,
             }
         } else {
             ItemDamageFunction::DEFAULT

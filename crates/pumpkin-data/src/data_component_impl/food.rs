@@ -23,8 +23,8 @@ pub struct FoodImpl {
 impl FoodImpl {
     pub fn read_data(data: &NbtTag) -> Option<Self> {
         let compound = data.extract_compound()?;
-        let nutrition = compound.get_int("nutrition")?;
-        let saturation = compound.get_float("saturation")?;
+        let nutrition = compound.get_numeric_int("nutrition")?;
+        let saturation = compound.get_numeric_float("saturation")?;
         let can_always_eat = compound.get_bool("can_always_eat").unwrap_or(false);
         Some(Self {
             nutrition,
@@ -65,11 +65,12 @@ impl StatusEffectInstance {
     pub fn read_data(nbt: &NbtTag) -> Option<Self> {
         let compound = nbt.extract_compound()?;
         let effect_id = Cow::Owned(compound.get_string("id")?.to_string());
-        let amplifier = compound.get_int("amplifier")?;
-        let duration = compound.get_int("duration")?;
-        let ambient = compound.get_bool("ambient")?;
-        let show_particles = compound.get_bool("show_particles")?;
-        let show_icon = compound.get_bool("show_icon")?;
+        // Defaults from vanilla `MobEffectInstance.Details.MAP_CODEC`.
+        let amplifier = compound.get_numeric_int("amplifier").unwrap_or(0);
+        let duration = compound.get_numeric_int("duration").unwrap_or(0);
+        let ambient = compound.get_bool("ambient").unwrap_or(false);
+        let show_particles = compound.get_bool("show_particles").unwrap_or(true);
+        let show_icon = compound.get_bool("show_icon").unwrap_or(show_particles);
         Some(Self {
             effect_id,
             amplifier,
@@ -220,14 +221,14 @@ impl ConsumeEffect {
     pub fn read_data(nbt: &NbtTag) -> Option<Self> {
         let compound = nbt.extract_compound()?;
         let r#type = compound.get_string("type")?;
-        match r#type {
+        match r#type.strip_prefix("minecraft:").unwrap_or(r#type) {
             "remove_effects" => {
                 let idset = IDSet::read(compound.get("effects")?)?;
                 Some(Self::RemoveEffects(idset))
             }
             "clear_all_effects" => Some(Self::ClearAllEffects),
             "teleport_randomly" => {
-                let dst = compound.get_float("diameter")?;
+                let dst = compound.get_numeric_float("diameter").unwrap_or(16.0);
                 Some(Self::TeleportRandomly(dst))
             }
             "play_sound" => {
@@ -235,7 +236,7 @@ impl ConsumeEffect {
                 Some(Self::PlaySound(sound))
             }
             "apply_effects" => {
-                let probability = compound.get_float("probability")?;
+                let probability = compound.get_numeric_float("probability").unwrap_or(1.0);
                 let effects_vec: Vec<StatusEffectInstance> = compound
                     .get_list("effects")?
                     .iter()

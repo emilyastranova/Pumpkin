@@ -245,56 +245,23 @@ pub fn read_block_slot(world: &World, pos: &BlockPos, slot: usize) -> Option<Ite
     (slot < inventory.size()).then(|| inventory.get_stack(slot))
 }
 
-/// Applies an inline item modifier (a single function or a list of them). Only the
-/// functions datapacks commonly use are implemented; others leave the stack as is.
-pub fn apply_item_modifier(stack: &mut ItemStack, modifier: &NbtTag) {
-    match modifier {
-        NbtTag::List(list) => {
-            for function in list {
-                apply_item_modifier(stack, function);
-            }
-        }
-        NbtTag::Compound(function) => {
-            let name = function.get_string("function").unwrap_or_default();
-            match name.strip_prefix("minecraft:").unwrap_or(name) {
-                "set_damage" => {
-                    let Some(max) = stack.get_max_damage() else {
-                        return;
-                    };
-                    let amount = number_provider(function.get("damage")).unwrap_or(1.0);
-                    let add = function.get_bool("add").unwrap_or(false);
-                    let base = if add {
-                        (max - stack.get_damage()) as f32 / max as f32
-                    } else {
-                        0.0
-                    };
-                    let durability = (base + amount).clamp(0.0, 1.0);
-                    let damage = max - (durability * max as f32).floor() as i32;
-                    stack.set_damage(damage.clamp(0, max));
-                }
-                "set_count" => {
-                    let amount = number_provider(function.get("count")).unwrap_or(1.0) as i32;
-                    let add = function.get_bool("add").unwrap_or(false);
-                    let count = if add {
-                        i32::from(stack.item_count) + amount
-                    } else {
-                        amount
-                    };
-                    stack.item_count = count.clamp(0, i32::from(stack.get_max_stack_size())) as u8;
-                }
-                other => tracing::debug!("Unsupported item modifier function {other}"),
-            }
-        }
-        _ => {}
-    }
+/// The command's `modifier` argument as NBT: an inline function or list, or a modifier id.
+fn modifier_argument(context: &CommandContext) -> Result<NbtTag, CommandSyntaxError> {
+    Ok(match ItemModifierArgumentType::get(context, "modifier")? {
+        ItemModifier::Inline(tag) => tag.clone(),
+        ItemModifier::Reference(id) => NbtTag::String(id.to_string().into()),
+    })
 }
 
-/// Reads a constant number provider (`1.0` or `{type:"constant",value:1.0}`).
-fn number_provider(tag: Option<&NbtTag>) -> Option<f32> {
-    match tag? {
-        NbtTag::Compound(c) => c.get("value").and_then(NbtTag::extract_float),
-        other => other.extract_float(),
-    }
+/// Applies a modifier like vanilla `ItemCommands.applyModifier`, then limits the stack size.
+fn apply_modifier(context: &CommandContext, modifier: &NbtTag, stack: ItemStack) -> ItemStack {
+    let mut stack = context
+        .source
+        .server()
+        .datapack_manager
+        .apply_item_modifier(stack, modifier);
+    stack.item_count = stack.item_count.min(stack.get_max_stack_size());
+    stack
 }
 
 /// Where `item replace ... from` copies its stack from.
@@ -326,10 +293,9 @@ impl ItemSource {
                 (stack, modified)
             }
         };
-        if modified
-            && let ItemModifier::Inline(tag) = ItemModifierArgumentType::get(context, "modifier")?
-        {
-            apply_item_modifier(&mut stack, tag);
+        if modified {
+            let modifier = modifier_argument(context)?;
+            stack = apply_modifier(context, &modifier, stack);
         }
         Ok(stack)
     }
@@ -403,14 +369,14 @@ impl CommandExecutor for EntityModifyExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let targets = EntityArgumentType::get_entities(context, "target")?;
         let slot = SlotArgumentType::get(context, "slots")?;
-        let ItemModifier::Inline(modifier) = ItemModifierArgumentType::get(context, "modifier")?
-        else {
-            return Ok(0);
-        };
+        let modifier = modifier_argument(context)?;
         let mut count = 0;
         for target in &targets {
-            if let Some(mut stack) = read_entity_slot(target, slot) {
-                apply_item_modifier(&mut stack, modifier);
+            // Vanilla only modifies slots that hold an item.
+            if let Some(stack) = read_entity_slot(target, slot)
+                && !stack.is_empty()
+            {
+                let stack = apply_modifier(context, &modifier, stack);
                 if write_entity_slot(target, slot, &stack) {
                     count += 1;
                 }
@@ -432,13 +398,13 @@ impl CommandExecutor for BlockModifyExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let pos = BlockPosArgumentType::get_loaded_block_pos(context, "target")?;
         let slot = SlotArgumentType::get(context, "slots")?;
-        let ItemModifier::Inline(modifier) = ItemModifierArgumentType::get(context, "modifier")?
-        else {
-            return Ok(0);
-        };
-        set_block_slot(context, &pos, slot, |mut stack| {
-            apply_item_modifier(&mut stack, modifier);
-            stack
+        let modifier = modifier_argument(context)?;
+        set_block_slot(context, &pos, slot, |stack| {
+            if stack.is_empty() {
+                stack
+            } else {
+                apply_modifier(context, &modifier, stack)
+            }
         })
     }
 }

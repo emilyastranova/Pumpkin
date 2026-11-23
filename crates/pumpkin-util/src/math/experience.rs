@@ -63,7 +63,7 @@ pub fn points_to_level(level: i32) -> i32 {
 /// remaining points within that level.
 #[must_use]
 pub fn total_to_level_and_points(total_points: i32) -> (i32, i32) {
-    let level = match total_points {
+    let estimate = match total_points {
         0..=352 => ((f64::from(total_points) + 9.0).sqrt() - 3.0) as i32,
         353..=1507 => (8.1 + (0.4 * (f64::from(total_points) - (7839.0 / 40.0))).sqrt()) as i32,
         _ => {
@@ -71,6 +71,15 @@ pub fn total_to_level_and_points(total_points: i32) -> (i32, i32) {
                 as i32
         }
     };
+    // The square roots above can land just under a whole level when the total is exactly
+    // a level's start (10000 levels gives 9999.999...), so settle the level on exact points.
+    let mut level = estimate.max(0);
+    while level > 0 && points_to_level(level) > total_points {
+        level -= 1;
+    }
+    while points_to_level(level + 1) <= total_points {
+        level += 1;
+    }
     let level_start = points_to_level(level);
     let points_into_level = total_points - level_start;
 
@@ -88,4 +97,32 @@ pub fn progress_in_level(points: i32, level: i32) -> f32 {
     let progress = (points as f32) / (max_points as f32);
 
     progress.clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{points_in_level, points_to_level, total_to_level_and_points};
+
+    #[test]
+    fn total_points_at_a_level_start_give_that_level() {
+        for level in [0, 1, 15, 16, 17, 30, 31, 32, 100, 9_999, 10_000, 20_000] {
+            assert_eq!(
+                total_to_level_and_points(points_to_level(level)),
+                (level, 0),
+                "start of level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn total_points_just_under_the_next_level_stay_on_the_level() {
+        for level in [0, 15, 16, 30, 31, 9_999, 10_000] {
+            let last_point = points_to_level(level) + points_in_level(level) - 1;
+            assert_eq!(
+                total_to_level_and_points(last_point),
+                (level, points_in_level(level) - 1),
+                "end of level {level}"
+            );
+        }
+    }
 }

@@ -15,6 +15,7 @@ pub use pumpkin_util::loot_table::{
 use pumpkin_util::random::{RandomImpl, xoroshiro128::Xoroshiro};
 
 mod generation;
+pub mod item_modifier;
 mod predicates;
 
 #[derive(Default, Clone)]

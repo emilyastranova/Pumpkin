@@ -13,6 +13,7 @@ pub mod structure_loader;
 pub mod tag_loader;
 pub mod test_loader;
 pub mod trade_loader;
+pub mod zip_pack;
 
 use std::collections::HashMap;
 use std::fs;
@@ -1707,7 +1708,11 @@ fn scan_datapacks_dir(
         let pack_path = entry.path();
         let file_name = entry.file_name().to_string_lossy().to_string();
 
-        if file_name.starts_with('.') || !pack_path.is_dir() {
+        let is_zip = pack_path.is_file()
+            && pack_path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+        if file_name.starts_with('.') || !(pack_path.is_dir() || is_zip) {
             continue;
         }
 
@@ -1718,6 +1723,18 @@ fn scan_datapacks_dir(
         if !is_enabled {
             continue;
         }
+
+        let pack_path = if is_zip {
+            match zip_pack::extracted_zip_pack(datapacks_dir, &pack_path, &file_name) {
+                Ok(extracted) => extracted,
+                Err(error) => {
+                    warn!("Failed to open datapack '{file_name}': {error}");
+                    continue;
+                }
+            }
+        } else {
+            pack_path
+        };
 
         let (description, pack_format, known_packs) = read_pack_mcmeta(&pack_path);
         let counts = load_pack_contents(&pack_path, acc);

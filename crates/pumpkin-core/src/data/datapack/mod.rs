@@ -336,6 +336,20 @@ impl DatapackManager {
         guard.get(&full_id).or_else(|| guard.get(id)).cloned()
     }
 
+    /// Applies an item modifier (a function, a list of functions, or the id of a data
+    /// pack item modifier) to `stack`, resolving ids against the loaded data packs.
+    #[must_use]
+    pub fn apply_item_modifier(
+        &self,
+        stack: pumpkin_data::item_stack::ItemStack,
+        modifier: &NbtTag,
+    ) -> pumpkin_data::item_stack::ItemStack {
+        crate::world::loot::item_modifier::apply_item_modifier(stack, modifier, &|id| {
+            self.get_item_modifier(id)
+                .map(|json| dynamic_registry_loader::json_to_nbt_tag(&json))
+        })
+    }
+
     #[must_use]
     pub fn get_item_modifier_ids(&self) -> Vec<String> {
         let guard = self
